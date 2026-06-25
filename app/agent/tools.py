@@ -385,7 +385,8 @@ async def search_documents_tool(query: str) -> str:
 
     # 按综合分数排序
     results.sort(key=lambda x: x.get("final_score", 0), reverse=True)
-    results = results[:5]  # [质量修复] 取 top 5（原 top 3 信息不足，增加检索量保证回答质量）
+    results = results[:5]  # [质量修复] 取 top 5（原 top 3 信息不足，增加检索量保证回答质量）
+
 
     output = f"【检索结果】共找到 {len(results)} 条相关内容：\n\n"
     for i, r in enumerate(results, 1):
@@ -784,6 +785,407 @@ def export_xlsx_tool(content: str, filename: str = "", title: str = "") -> str:
         return f"【导出失败】{str(e)}"
 
 
+# ===== 8D 报告生成工具 =====
+
+@tool
+def generate_8d_report_tool(
+    product: str,
+    defect: str,
+    customer: str,
+    defect_rate: str = "500PPM",
+    batch_size: str = "12",
+    template: str = "generic-defect",
+    five_why_steps: str = "",
+    rc_summary: str = "",
+    containment_actions: str = "",
+    permanent_actions: str = "",
+    yokoten_actions: str = "",
+    auto_fill: bool = False
+) -> str:
+    """生成专业的汽车行业 8D 报告（同时生成 xlsx 和 docx 两个文件）。
+
+    【用途】当用户需要 8D 报告（汽车行业问题解决报告、客户投诉报告、SCAR、根因分析报告）时使用。
+    【典型触发】
+    - 「生成8D报告」「8D分析」
+    - 「客户投诉 + 产品 + 缺陷」
+    - 「根因分析报告」「SCAR」
+    - 「质量问题追溯」
+    【为什么必须用这个工具而不是 export_xlsx_tool】
+    - generate_8d_report_tool 会调用 skills/8d-skill/scripts/generate_8d.py 脚本
+    - 生成的 xlsx 带合并单元格、深蓝章节标题、交替行底色、根因黄色高亮等专业样式
+    - 生成的 docx 是标准 8D Word 文档，可直接提交客户
+    - export_xlsx_tool 只能生成简单表格，无样式，不适合 8D 报告
+    【模板选择规则】
+    - 缺陷涉及漆面/涂装/颗粒/流挂/色差/橘皮/缩孔 → paint-defect
+    - 缺陷涉及装配/间隙/面差/卡扣/异响/松动 → assembly-defect
+    - 缺陷涉及焊接/虚焊/焊穿/焊渣/焊点/强度 → welding-defect
+    - 缺陷涉及尺寸/超差/CPK/公差/变形/收缩 → dimensional-defect
+    - 其他/无法明确分类 → generic-defect
+
+    Args:
+        product: 产品名称（如「前保险杠总成」「轮毂」「ECU」）
+        defect: 缺陷描述（如「漆面颗粒」「装配间隙超差」「凹陷」）
+        customer: 客户名称（如「比亚迪」「一汽大众」）
+        defect_rate: 不良率（默认 500PPM，安全件用 50PPM，严禁用 3%/5%/8% 等灾难级数字）
+        batch_size: 批次数量（8D 分析样本数，不是生产批量，默认 12，线束类用 5）
+        template: 模板 slug，可选值: paint-defect/assembly-defect/welding-defect/dimensional-defect/generic-defect
+        five_why_steps: 可选，动态 5Why 内容（JSON 字符串）。当 Agent 已对缺陷做了根因分析时传入，覆盖模板预填的 5Why。
+            格式: [{"level":"Why 1","question":"为什么...？","answer":"...","evidence":"..."},...]
+            必须包含 6 步：问题 + Why1 + Why2 + Why3 + Why4 + Why5（根因）
+            如果为空字符串，则使用模板预填的 5Why 路径
+        rc_summary: 可选，动态根因总结（JSON 字符串）。当 Agent 已推演了 RC1/RC2/RC3 时传入，覆盖模板预填的 root_cause_summary。
+            格式: [{"id":"RC1","description":"直接原因描述","type":"直接原因"},{"id":"RC2","description":"管理原因","type":"管理原因"},{"id":"RC3","description":"系统原因","type":"系统原因"}]
+            必须包含 3 条：RC1（直接原因）+ RC2（管理原因）+ RC3（系统原因）
+            如果为空字符串，则使用模板预填的 RC 总结
+        containment_actions: 可选，动态 D3 遏制措施（JSON 字符串）。当 Agent 已在对话中输出了遏制措施时传入，覆盖模板预填。
+            格式: ["措施1描述","措施2描述","措施3描述",...]
+            如果为空字符串，则使用模板预填的遏制措施
+        permanent_actions: 可选，动态 D5-D6 永久纠正措施（JSON 字符串）。当 Agent 已在对话中输出了 CA 方案时传入，覆盖模板预填。
+            格式: [{"action":"措施描述","target":"针对根因","responsible":"责任人","due_date":"完成时间"},...]
+            如果为空字符串，则使用模板预填的永久纠正措施
+        yokoten_actions: 可选，动态 D7 横向展开措施（JSON 字符串）。当 Agent 已在对话中输出了横向展开方案时传入，覆盖模板预填。
+            格式: ["措施1描述","措施2描述","措施3描述",...]
+            如果为空字符串，则使用模板预填的横向展开措施
+        auto_fill: 可选，自动填充模式（默认 False）。当用户明确说「你帮我填」「给我示例」「看一下范例」「其他不要问我」时设为 True。
+            启用后脚本会把所有 ____ 空白替换为合理示例值（化名/示例日期/角色分配）：
+            - D1 团队姓名：张伟/李娜/王芳/刘强/陈静/赵磊/周敏/孙健（按角色分配）
+            - D1 联系方式：内部分机号 8001-8009
+            - D3/D5/D6/D7 责任人：按措施类型分配角色
+            - D3/D5/D6/D7 完成时间：当前日期 + 2/3/5/7/14/30 天
+            - D8 签名/日期：化名 + 当天日期
+            - 其他字段（客户联系人/投诉日期/批次号等）：合理示例值
+            注意：D4 5Why/6M 的「请填写」引导提示不会被替换，保留给用户填实际分析内容
+    """
+    import subprocess
+    import sys
+    import json as _json
+    import re as _re
+
+    # ── JSON 修复函数：LLM 生成的 JSON 常见错误自动修复 ──
+    def _repair_llm_json(raw: str) -> str:
+        """尝试修复 LLM 生成的常见 JSON 格式错误。
+
+        常见问题：
+        1. 中文标点混入：，→,  ：→: 或 ,  "→"  "→"
+        2. 缺少逗号：相邻 }{ 或 ][ 或 }[ 或 ]{ 之间缺逗号
+        3. 尾部多余逗号：},] 或 ,}
+        4. 值中有未转义的换行符
+        5. 单引号代替双引号
+        6. 缺少引号的 key
+        7. "value""key": 之间缺逗号
+        8. "value":"key": 冒号误用为分隔符
+        """
+        s = raw.strip()
+        if not s:
+            return s
+
+        # 1. 中文左右引号 "…" 替换为英文 "
+        s = s.replace('\u201c', '"')   # " → "
+        s = s.replace('\u201d', '"')   # " → "
+        s = s.replace('\u2018', "'")   # ' → '
+        s = s.replace('\u2019', "'")   # ' → '
+
+        # 2. 中文逗号替换为英文逗号
+        s = s.replace('\uff0c', ',')   # ，→ ,
+        s = s.replace('\uff08', '(')   # （→ (
+        s = s.replace('\uff09', ')')   # ）→ )
+
+        # 3. 中文冒号：先统一替换为英文冒号，后面再修复"冒号误用为分隔符"的情况
+        s = s.replace('\uff1a', ':')   # ：→ :
+
+        # 4. 单引号 → 双引号
+        s = s.replace("'", '"')
+
+        # 5. 修复冒号误用为属性分隔符的情况：
+        #    LLM 有时生成 {"key1":"value1"："key2":"value2"}
+        #    替换后变成 {"key1":"value1":"key2":"value2"}
+        #    规则：如果 "xxx":"yyy":"zzz" 中间的冒号实际上应该是逗号
+        #    检测模式："非冒号内容":"内容":"字母开头"  中间冒号改为逗号
+        #    即 "value":"key": 模式中，第一个冒号后的值结束后的冒号应该是逗号
+        #    更安全的做法：反复查找 "string":"string": 并在中间加逗号
+        #    但要注意不要误改 "key":"value" 的正常模式
+        #    关键洞察：正常JSON中，冒号只出现在 "key": 后面，不会出现在 "value" 后面
+        #    所以如果 ":" 出现在一个看起来是value的引号字符串后面，且后面又跟着 "key":
+        #    那这个冒号应该是逗号
+        #    简化实现：匹配 "非空字符串":"非空字符串": 并将第二个冒号及后面的模式改为 ,
+        #    反复执行直到没有更多匹配
+        for _ in range(10):  # 最多修复10轮，避免无限循环
+            # 匹配："xxx":"yyy":  其中 yyy 不是以 { [ 开头
+            # 这里的冒号应该改为逗号
+            new_s = _re.sub(
+                r'("(?:[^"\\]|\\.)*")\s*:\s*("(?:[^"\\]|\\.)*")\s*:',
+                r'\1:\2,',
+                s
+            )
+            if new_s == s:
+                break
+            s = new_s
+
+        # 6. 修复缺少逗号的情况：}{  →  },{   ][  →  ],[
+        s = _re.sub(r'\}\s*\{', '},{', s)
+        s = _re.sub(r'\]\s*\[', '],[', s)
+        s = _re.sub(r'\}\s*\[', '},[', s)
+        s = _re.sub(r'\]\s*\{', '],{', s)
+
+        # 7. 去掉尾部多余逗号：,]  →  ]  ,}  →  }
+        s = _re.sub(r',\s*\]', ']', s)
+        s = _re.sub(r',\s*\}', '}', s)
+
+        # 8. 修复值中未转义的换行符（在双引号内的裸换行）
+        def _fix_newlines_in_strings(m):
+            content = m.group(1)
+            content = content.replace('\n', '\\n')
+            content = content.replace('\r', '')
+            return '"' + content + '"'
+        s = _re.sub(r'"((?:[^"\\]|\\.)*)"', _fix_newlines_in_strings, s, flags=_re.DOTALL)
+
+        # 9. 修复缺少引号的 key：如  {id:"RC1"}  →  {"id":"RC1"}
+        s = _re.sub(r'([{\[,])\s*([a-zA-Z_]\w*)\s*:', r'\1"\2":', s)
+
+        # 10. 修复 "value""key":  →  "value","key":（值和下一个key之间缺逗号）
+        s = _re.sub(r'"\s+"([a-zA-Z_])', r'",\1', s)
+
+        return s
+
+    def _safe_parse_json(raw: str, label: str = ""):
+        """安全解析 JSON，先尝试原始解析，失败则尝试修复后解析。"""
+        if not raw or not raw.strip():
+            return None
+        raw = raw.strip()
+        # 第一次：直接解析
+        try:
+            return _json.loads(raw)
+        except _json.JSONDecodeError:
+            pass
+        # 第二次：修复后解析
+        try:
+            repaired = _repair_llm_json(raw)
+            result = _json.loads(repaired)
+            logger.info(f"[8D] {label} JSON 修复成功（原始格式有误，已自动修复）")
+            return result
+        except _json.JSONDecodeError as e2:
+            logger.warning(f"[8D] {label} JSON 修复后仍无法解析: {e2}")
+            # 第三次：终极修复 — 用正则暴力提取关键字段
+            try:
+                # 尝试用 ast.literal_eval 作为最后手段
+                import ast
+                # 替换 True/False/None 为 Python 字面量
+                py_str = raw.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+                result = ast.literal_eval(py_str)
+                logger.info(f"[8D] {label} JSON 通过 ast.literal_eval 修复成功")
+                return result
+            except Exception:
+                logger.warning(f"[8D] {label} JSON 所有修复方式均失败，忽略该参数")
+                return None
+
+    try:
+        # 定位 generate_8d.py 脚本路径
+        # settings.DATA_DIR 是项目根/data，脚本在 项目根/skills/8d-skill/scripts/generate_8d.py
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        script_path = os.path.join(project_root, "skills", "8d-skill", "scripts", "generate_8d.py")
+
+        if not os.path.exists(script_path):
+            return f"【8D报告生成失败】未找到脚本: {script_path}。请确认 skills/8d-skill/scripts/generate_8d.py 已部署。"
+
+        # 输出目录：data/export/（根目录，不走 session_id 子目录）
+        # 原因：下载端点 /api/v1/documents/export-download/{filename} 会先搜子目录再搜根目录
+        # 但如果 session_id 不为空，文件存在子目录里，下载端点遍历子目录可能因各种原因找不到
+        # 8D 报告文件直接存根目录，下载端点的"根目录查找"能 100% 命中
+        export_dir = os.path.join(settings.DATA_DIR, "export")
+        os.makedirs(export_dir, exist_ok=True)
+
+        # 构造命令
+        cmd = [
+            sys.executable,
+            script_path,
+            "--product", product,
+            "--defect", defect,
+            "--customer", customer,
+            "--defect-rate", defect_rate,
+            "--batch-size", batch_size,
+            "--template", template,
+            "--output-dir", export_dir,
+        ]
+
+        # 如果传入了动态 5Why，加 --five-why-json 参数
+        has_dynamic_5why = False
+        if five_why_steps and five_why_steps.strip():
+            # 尝试解析 JSON（含自动修复）
+            parsed_5why = _safe_parse_json(five_why_steps, "five_why_steps")
+            if parsed_5why is not None:
+                # 序列化回标准 JSON 字符串（确保格式正确）
+                clean_5why_json = _json.dumps(parsed_5why, ensure_ascii=False)
+                cmd.extend(["--five-why-json", clean_5why_json])
+                logger.info(f"[8D] 启用动态 5Why 覆盖（{len(clean_5why_json)} chars）")
+                has_dynamic_5why = True
+            else:
+                logger.warning(f"[8D] five_why_steps JSON 无法解析（已尝试修复），继续用模板预填 5Why")
+
+        # 如果传入了动态 RC 总结，加 --rc-summary-json 参数
+        has_rc_summary = False
+        if rc_summary and rc_summary.strip():
+            # 尝试解析 JSON（含自动修复）
+            parsed_rc = _safe_parse_json(rc_summary, "rc_summary")
+            if parsed_rc is not None:
+                # 序列化回标准 JSON 字符串（确保格式正确）
+                clean_rc_json = _json.dumps(parsed_rc, ensure_ascii=False)
+                cmd.extend(["--rc-summary-json", clean_rc_json])
+                logger.info(f"[8D] 启用动态 RC 覆盖（{len(clean_rc_json)} chars）")
+                has_rc_summary = True
+            else:
+                logger.warning(f"[8D] rc_summary JSON 无法解析（已尝试修复），继续用模板预填 RC")
+
+        # 如果传入了动态 D3 遏制措施，加 --containment-actions-json 参数
+        has_containment = False
+        if containment_actions and containment_actions.strip():
+            parsed_ca = _safe_parse_json(containment_actions, "containment_actions")
+            if parsed_ca is not None:
+                clean_ca_json = _json.dumps(parsed_ca, ensure_ascii=False)
+                cmd.extend(["--containment-actions-json", clean_ca_json])
+                logger.info(f"[8D] 启用动态 D3 遏制措施覆盖（{len(clean_ca_json)} chars）")
+                has_containment = True
+            else:
+                logger.warning(f"[8D] containment_actions JSON 无法解析，继续用模板预填")
+
+        # 如果传入了动态 D5-D6 永久纠正措施，加 --permanent-actions-json 参数
+        has_permanent = False
+        if permanent_actions and permanent_actions.strip():
+            parsed_pa = _safe_parse_json(permanent_actions, "permanent_actions")
+            if parsed_pa is not None:
+                clean_pa_json = _json.dumps(parsed_pa, ensure_ascii=False)
+                cmd.extend(["--permanent-actions-json", clean_pa_json])
+                logger.info(f"[8D] 启用动态 D5-D6 永久纠正措施覆盖（{len(clean_pa_json)} chars）")
+                has_permanent = True
+            else:
+                logger.warning(f"[8D] permanent_actions JSON 无法解析，继续用模板预填")
+
+        # 如果传入了动态 D7 横向展开措施，加 --yokoten-actions-json 参数
+        has_yokoten = False
+        if yokoten_actions and yokoten_actions.strip():
+            parsed_yk = _safe_parse_json(yokoten_actions, "yokoten_actions")
+            if parsed_yk is not None:
+                clean_yk_json = _json.dumps(parsed_yk, ensure_ascii=False)
+                cmd.extend(["--yokoten-actions-json", clean_yk_json])
+                logger.info(f"[8D] 启用动态 D7 横向展开措施覆盖（{len(clean_yk_json)} chars）")
+                has_yokoten = True
+            else:
+                logger.warning(f"[8D] yokoten_actions JSON 无法解析，继续用模板预填")
+
+        # 🔴 关键修复：auto_fill 只能由用户明确要求触发
+        # 用户给根因线索（five_why_steps）≠ 要示例，只是让 5Why 更精准
+        # 只有用户明确说"示例/随便填/你帮我填"时，Agent 才会传 auto_fill=True
+        if auto_fill:
+            cmd.append("--auto-fill")
+            logger.info(f"[8D] 启用自动填充模式（用户明确要求示例）")
+
+        logger.info(f"[8D] 调用 generate_8d.py: {' '.join(cmd[:6])}...")
+
+        # 执行脚本（超时 60 秒）
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            encoding='utf-8',
+            errors='replace',
+            cwd=project_root,
+        )
+
+        if result.returncode != 0:
+            err_msg = result.stderr[-500:] if result.stderr else "无 stderr 输出"
+            return f"【8D报告生成失败】脚本执行错误（返回码 {result.returncode}）：\n{err_msg}"
+
+        # 从 stdout 解析 RESULT_JSON
+        stdout = result.stdout or ""
+        json_match = _re.search(r'\[RESULT_JSON\]\s*(\{.*?\})\s*$', stdout, _re.DOTALL)
+        if json_match:
+            try:
+                result_data = _json.loads(json_match.group(1))
+                xlsx_path = result_data.get("excel_path", "")
+                docx_path = result_data.get("word_path", "")
+                report_number = result_data.get("report_number", "")
+                matched_template = result_data.get("template_slug", template)
+
+                # 提取文件名（去掉目录部分）
+                xlsx_name = os.path.basename(xlsx_path) if xlsx_path else ""
+                docx_name = os.path.basename(docx_path) if docx_path else ""
+
+                # 🔴 关键验证：检查文件是否真的存在
+                xlsx_exists = xlsx_path and os.path.exists(xlsx_path)
+                docx_exists = docx_path and os.path.exists(docx_path)
+                
+                if not xlsx_exists and not docx_exists:
+                    return f"【8D报告生成失败】脚本报告成功但文件不存在。\nxlsx_path: {xlsx_path}\ndocx_path: {docx_path}\nstdout: {stdout[-300:]}"
+                
+                logger.info(f"[8D] 文件验证: xlsx={'存在' if xlsx_exists else '不存在'} ({xlsx_path}), docx={'存在' if docx_exists else '不存在'} ({docx_path})")
+
+                # 生成下载链接（前端会拦截这些 URL）
+                xlsx_url = f"/api/v1/documents/export-download/{xlsx_name}" if xlsx_name else ""
+                docx_url = f"/api/v1/documents/export-download/{docx_name}" if docx_name else ""
+
+                # 明确告诉 Agent 实际启用了哪些模式
+                modes_enabled = []
+                if has_dynamic_5why:
+                    modes_enabled.append("动态 5Why 覆盖（已填入您推演的根因路径）")
+                if has_rc_summary:
+                    modes_enabled.append("动态 RC 覆盖（已填入您推演的 RC1/RC2/RC3）")
+                if has_containment:
+                    modes_enabled.append("动态 D3 遏制措施覆盖")
+                if has_permanent:
+                    modes_enabled.append("动态 D5-D6 CA 措施覆盖")
+                if has_yokoten:
+                    modes_enabled.append("动态 D7 横向展开覆盖")
+                if auto_fill:
+                    modes_enabled.append("自动填充模式（人名/日期/责任人已填示例值）")
+                modes_str = " + ".join(modes_enabled) if modes_enabled else "默认模式（空白处留 ____）"
+                
+                # 构建返回消息（标注文件是否存在）
+                xlsx_line = f"📄 Excel 文件：{xlsx_name}\n下载链接：{xlsx_url}\n" if xlsx_exists else f"📄 Excel 文件：生成失败\n"
+                docx_line = f"📝 Word 文件：{docx_name}\n下载链接：{docx_url}\n" if docx_exists else f"📝 Word 文件：生成失败\n"
+                
+                return (
+                    f"【8D报告生成成功】\n"
+                    f"报告编号：{report_number}\n"
+                    f"匹配模板：{matched_template}\n"
+                    f"启用模式：{modes_str}\n\n"
+                    f"{xlsx_line}"
+                    f"说明：单 Sheet 完整 Excel，含合并单元格+章节标题+交替行底色+根因高亮，可继续编辑\n\n"
+                    f"{docx_line}"
+                    f"说明：标准 8D Word 文档，可编辑后使用\n\n"
+                    f"【重要】你必须在回复中完整展示上面的下载链接 URL，前端依赖这些 URL 生成下载按钮。\n"
+                    f"【重要】不要在对话中重复输出 8D 报告的完整内容，用户可以直接下载文件查看。\n"
+                    f"只需简要告诉用户：报告已生成、匹配了什么模板、{'空白处已填示例值' if auto_fill else '空白处需补充实际数据'}。"
+                )
+            except _json.JSONDecodeError as e:
+                return f"【8D报告生成失败】解析脚本输出 JSON 失败: {e}\n原始输出: {stdout[-500:]}"
+
+        # 如果没有 RESULT_JSON，尝试从 stdout 中查找文件路径
+        xlsx_match = _re.search(r'Excel 已生成[：:]\s*(.+?\.xlsx)', stdout)
+        docx_match = _re.search(r'Word 已生成[：:]\s*(.+?\.docx)', stdout)
+
+        if xlsx_match or docx_match:
+            msg = "【8D报告生成成功】\n"
+            if xlsx_match:
+                xlsx_name = os.path.basename(xlsx_match.group(1).strip())
+                msg += f"📄 Excel 文件：{xlsx_name}\n下载链接：/api/v1/documents/export-download/{xlsx_name}\n\n"
+            if docx_match:
+                docx_name = os.path.basename(docx_match.group(1).strip())
+                msg += f"📝 Word 文件：{docx_name}\n下载链接：/api/v1/documents/export-download/{docx_name}\n\n"
+            msg += "【重要】你必须在回复中完整展示上面的下载链接 URL，前端依赖这些 URL 生成下载按钮。"
+            return msg
+
+        return f"【8D报告生成失败】脚本执行成功但未找到文件路径。\nstdout: {stdout[-500:]}\nstderr: {result.stderr[-500:] if result.stderr else ''}"
+
+    except subprocess.TimeoutExpired:
+        return "【8D报告生成失败】脚本执行超时（60秒），请检查 openpyxl/python-docx 是否已安装，或缩减输入内容后重试。"
+    except FileNotFoundError as e:
+        return f"【8D报告生成失败】Python 解释器未找到: {e}"
+    except Exception as e:
+        logger.exception("[8D] generate_8d_report_tool 异常")
+        return f"【8D报告生成失败】{type(e).__name__}: {str(e)}"
+
+
+
 # ===== [#12] 外部系统集成工具 =====
 
 @tool
@@ -1071,6 +1473,7 @@ BASE_TOOLS = [
     modify_document_tool,
     export_document_tool,
     export_xlsx_tool,
+    generate_8d_report_tool,
 ]
 
 # 联网搜索工具（按需启用）

@@ -2783,6 +2783,13 @@ function clearSkill() {
     showToast('已退出技能模式');
 }
 
+// 开发中 skill 点击：仅展示提示，不切换 selectedSkill
+function showDevSkillToast(skillName) {
+    const dropdown = document.getElementById('skillsDropdown');
+    if (dropdown) dropdown.classList.remove('show');
+    showToast('「' + skillName + '」 Skill需要公司资深专家参与，敬请期待', 3500);
+}
+
 async function exportChat(format) {
     if (!currentChatId) return;
     const dropdown = document.getElementById('exportDropdown');

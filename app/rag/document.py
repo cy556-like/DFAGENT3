@@ -3469,6 +3469,39 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
         if adjusted_width > existing:
             ws.column_dimensions[col_letter].width = adjusted_width
     
+    # ── 自动行高：根据单元格内容和列宽精确计算换行数，确保文字完全可见 ──
+    def _calc_line_count(text: str, col_w: float) -> int:
+        """计算文本在指定列宽下需要的行数（考虑 CJK 宽度和显式换行符）。"""
+        if not text:
+            return 1
+        # 实际文本区宽度：列宽减去单元格内边距（约4字符宽）
+        effective_width = max(col_w - 4, 3)
+        segments = text.split('\n')
+        total_lines = 0
+        for segment in segments:
+            if not segment.strip():
+                total_lines += 1  # 空行也算一行
+                continue
+            seg_w = _display_width(segment)
+            lines_needed = max(1, -(-seg_w // effective_width))  # 向上取整 ceil(a/b)
+            total_lines += lines_needed
+        return max(1, total_lines)
+
+    LINE_HEIGHT = 22  # 每行高度（磅），确保10-11号字完整显示
+    ROW_PADDING = 8   # 上下边距（磅）
+    for row_idx_offset, row in enumerate(rows_data):
+        row_idx = table_start_row + row_idx_offset
+        max_lines = 1
+        for col_idx, cell_text in enumerate(row[:num_cols], 1):
+            clean_text = re.sub(r'\*+', '', cell_text)
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            col_w = ws.column_dimensions[col_letter].width or 10
+            line_count = _calc_line_count(clean_text, col_w)
+            max_lines = max(max_lines, line_count)
+        # 行高 = 行数 × 每行高度 + 上下边距
+        calculated_height = max(25, min(409, max_lines * LINE_HEIGHT + ROW_PADDING))
+        ws.row_dimensions[row_idx].height = calculated_height
+    
     # 返回下一段内容应写入的起始行（表格末尾 + 2 行空行作为视觉间隔）
     next_row = table_start_row + len(rows_data) + 2
     return next_row
