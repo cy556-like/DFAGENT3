@@ -3182,21 +3182,33 @@ def export_document_as_xlsx(content: str, filename: str, title: str = "", sessio
         file_path = os.path.join(export_dir, filename)
         wb = Workbook()
         
-        # Styles
-        header_font = Font(bold=True, size=11, name='微软雅黑', color='FFFFFF')
+        # ════════════════════════════════════════════════════════════════
+        # 样式定义 — 参照 8D 报告专业风格，统一视觉标准
+        # ════════════════════════════════════════════════════════════════
+        # 字体：优先微软雅黑（中文），回退宋体
+        _font_name = '微软雅黑'
+        
+        # 表头样式：深蓝底白字加粗
+        header_font = Font(bold=True, size=11, name=_font_name, color='FFFFFF')
         header_fill = PatternFill(start_color='003366', end_color='003366', fill_type='solid')
         header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        cell_font = Font(size=10, name='微软雅黑', color='000000')
+        
+        # 正文样式：交替行浅蓝 + 白
+        cell_font = Font(size=10, name=_font_name, color='000000')
         cell_alignment = Alignment(vertical='center', wrap_text=True)
         alt_fill = PatternFill(start_color='D6E4F0', end_color='D6E4F0', fill_type='solid')
-        info_font = Font(size=10, name='微软雅黑', bold=True, color='003366')
+        
+        # 说明文本/标题行样式：淡黄底深蓝字
+        info_font = Font(size=10, name=_font_name, bold=True, color='003366')
         info_fill = PatternFill(start_color='FFF8E1', end_color='FFF8E1', fill_type='solid')
         info_alignment = Alignment(vertical='center', wrap_text=True)
+        
+        # 细边框
         thin_border = Border(
-            left=Side(style='thin'),
-            right=Side(style='thin'),
-            top=Side(style='thin'),
-            bottom=Side(style='thin')
+            left=Side(style='thin', color='000000'),
+            right=Side(style='thin', color='000000'),
+            top=Side(style='thin', color='000000'),
+            bottom=Side(style='thin', color='000000')
         )
         
         # Parse content and extract tables
@@ -3329,6 +3341,9 @@ def export_document_as_xlsx(content: str, filename: str, title: str = "", sessio
                 ws.cell(row=cursor_row, column=1, value=text)
                 cursor_row += 1
         
+        # 冻结首行（表头始终可见）
+        ws.freeze_panes = 'A2'
+        
         wb.save(file_path)
         
         return {
@@ -3386,18 +3401,23 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
                 cell_val = ws.cell(row=row_num, column=2, value=kv_match.group(2).strip())
                 cell_key.font = info_font or cell_font
                 cell_key.alignment = info_alignment or cell_alignment
-                if info_fill:
-                    cell_key.fill = info_fill
+                cell_key.border = thin_border
                 cell_val.font = info_font or cell_font
                 cell_val.alignment = info_alignment or cell_alignment
+                cell_val.border = thin_border
+                # 淡黄底色
                 if info_fill:
+                    cell_key.fill = info_fill
                     cell_val.fill = info_fill
             else:
                 cell = ws.cell(row=row_num, column=1, value=text)
                 cell.font = info_font or cell_font
                 cell.alignment = info_alignment or cell_alignment
+                cell.border = thin_border
                 if info_fill:
                     cell.fill = info_fill
+            # 说明行行高
+            ws.row_dimensions[row_num].height = 22
             info_row_count = i + 1
     
     # 表格前留一空行（仅当上方有 info_lines 时）
@@ -3416,15 +3436,19 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
             cell.border = thin_border
             
             if row_idx_offset == 0:
-                # Header row
+                # Header row：深蓝底白字
                 cell.font = header_font
                 cell.fill = header_fill
                 cell.alignment = header_alignment
             else:
+                # Data row：交替行浅蓝/白底
                 cell.font = cell_font
                 cell.alignment = cell_alignment
                 if alt_fill and row_idx_offset % 2 == 0:
                     cell.fill = alt_fill
+        # 表头行高固定28，数据行由后面行高计算逻辑处理
+        if row_idx_offset == 0:
+            ws.row_dimensions[row_idx].height = 28
     
     # Auto-adjust column widths (CJK-aware: 中文算2单位，英文算1单位)
     def _display_width(s: str) -> int:
