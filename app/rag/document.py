@@ -3183,12 +3183,14 @@ def export_document_as_xlsx(content: str, filename: str, title: str = "", sessio
         wb = Workbook()
         
         # Styles
-        header_font = Font(bold=True, size=11, name='宋体')
-        header_fill = PatternFill(start_color='D9E2F3', end_color='D9E2F3', fill_type='solid')
+        header_font = Font(bold=True, size=11, name='微软雅黑', color='FFFFFF')
+        header_fill = PatternFill(start_color='003366', end_color='003366', fill_type='solid')
         header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        cell_font = Font(size=10, name='宋体')
+        cell_font = Font(size=10, name='微软雅黑', color='000000')
         cell_alignment = Alignment(vertical='center', wrap_text=True)
-        info_font = Font(size=10, name='宋体')
+        alt_fill = PatternFill(start_color='D6E4F0', end_color='D6E4F0', fill_type='solid')
+        info_font = Font(size=10, name='微软雅黑', bold=True, color='003366')
+        info_fill = PatternFill(start_color='FFF8E1', end_color='FFF8E1', fill_type='solid')
         info_alignment = Alignment(vertical='center', wrap_text=True)
         thin_border = Border(
             left=Side(style='thin'),
@@ -3296,7 +3298,8 @@ def export_document_as_xlsx(content: str, filename: str, title: str = "", sessio
                         wb, ws, current_rows, cursor_row,
                         header_font, header_fill, header_alignment, 
                         cell_font, cell_alignment, thin_border,
-                        info_lines=pending_info_lines, info_font=info_font, info_alignment=info_alignment
+                        info_lines=pending_info_lines, info_font=info_font, info_alignment=info_alignment,
+                        alt_fill=alt_fill, info_fill=info_fill
                     )
                     current_rows = []
                     pending_info_lines = []
@@ -3315,7 +3318,8 @@ def export_document_as_xlsx(content: str, filename: str, title: str = "", sessio
                 wb, ws, current_rows, cursor_row,
                 header_font, header_fill, header_alignment,
                 cell_font, cell_alignment, thin_border,
-                info_lines=pending_info_lines, info_font=info_font, info_alignment=info_alignment
+                info_lines=pending_info_lines, info_font=info_font, info_alignment=info_alignment,
+                alt_fill=alt_fill, info_fill=info_fill
             )
             pending_info_lines = []
         
@@ -3350,7 +3354,8 @@ def _sanitize_sheet_name(name: str) -> str:
 def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
                                 header_font, header_fill, header_alignment,
                                 cell_font, cell_alignment, thin_border,
-                                info_lines=None, info_font=None, info_alignment=None):
+                                info_lines=None, info_font=None, info_alignment=None,
+                                alt_fill=None, info_fill=None):
     """将解析出的表格行写入指定 worksheet，从 start_row 开始向下追加。
     
     【单 Sheet 设计】不再创建新 Sheet，所有内容追加到传入的 ws 上。
@@ -3363,6 +3368,8 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
         info_lines: 表格上方要写入的说明文本（如项目信息）
         info_font: 说明文本字体
         info_alignment: 说明文本对齐方式
+        alt_fill: 交替行填充色
+        info_fill: 说明行填充色
     
     Returns:
         int: 下一段内容应该写入的起始行号（cursor_row）
@@ -3379,12 +3386,18 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
                 cell_val = ws.cell(row=row_num, column=2, value=kv_match.group(2).strip())
                 cell_key.font = info_font or cell_font
                 cell_key.alignment = info_alignment or cell_alignment
+                if info_fill:
+                    cell_key.fill = info_fill
                 cell_val.font = info_font or cell_font
                 cell_val.alignment = info_alignment or cell_alignment
+                if info_fill:
+                    cell_val.fill = info_fill
             else:
                 cell = ws.cell(row=row_num, column=1, value=text)
                 cell.font = info_font or cell_font
                 cell.alignment = info_alignment or cell_alignment
+                if info_fill:
+                    cell.fill = info_fill
             info_row_count = i + 1
     
     # 表格前留一空行（仅当上方有 info_lines 时）
@@ -3410,6 +3423,8 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
             else:
                 cell.font = cell_font
                 cell.alignment = cell_alignment
+                if alt_fill and row_idx_offset % 2 == 0:
+                    cell.fill = alt_fill
     
     # Auto-adjust column widths (CJK-aware: 中文算2单位，英文算1单位)
     def _display_width(s: str) -> int:
@@ -3474,8 +3489,8 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
         """计算文本在指定列宽下需要的行数（考虑 CJK 宽度和显式换行符）。"""
         if not text:
             return 1
-        # 实际文本区宽度：列宽减去单元格内边距（约4字符宽）
-        effective_width = max(col_w - 4, 3)
+        # 实际文本区宽度：列宽减去单元格内边距（约3字符宽）
+        effective_width = max(col_w - 3, 4)
         segments = text.split('\n')
         total_lines = 0
         for segment in segments:
@@ -3487,8 +3502,8 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
             total_lines += lines_needed
         return max(1, total_lines)
 
-    LINE_HEIGHT = 22  # 每行高度（磅），确保10-11号字完整显示
-    ROW_PADDING = 8   # 上下边距（磅）
+    LINE_HEIGHT = 17  # 每行高度（磅），紧凑但完整显示
+    ROW_PADDING = 4   # 上下边距（磅）
     for row_idx_offset, row in enumerate(rows_data):
         row_idx = table_start_row + row_idx_offset
         max_lines = 1
@@ -3499,7 +3514,7 @@ def _write_rows_to_xlsx_sheet(wb, ws, rows_data, start_row,
             line_count = _calc_line_count(clean_text, col_w)
             max_lines = max(max_lines, line_count)
         # 行高 = 行数 × 每行高度 + 上下边距
-        calculated_height = max(25, min(409, max_lines * LINE_HEIGHT + ROW_PADDING))
+        calculated_height = max(20, min(409, max_lines * LINE_HEIGHT + ROW_PADDING))
         ws.row_dimensions[row_idx].height = calculated_height
     
     # 返回下一段内容应写入的起始行（表格末尾 + 2 行空行作为视觉间隔）
