@@ -7,7 +7,7 @@
 """
 import os
 import logging
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -62,11 +62,10 @@ MODEL_V41_RESTRICTED_WINDOWS = ((dt_time(9, 0), dt_time(12, 0)), (dt_time(14, 0)
 
 def is_v41_restricted_time(now: datetime | None = None) -> bool:
     """判断当前是否处于 4.1 的受限时段（左闭右开）。"""
-    try:
-        local_now = (now or datetime.now(ZoneInfo(MODEL_SCHEDULE_TIMEZONE)))
-    except Exception:
-        # 时区配置错误时保持服务可用，退回服务器本地时间。
-        local_now = now or datetime.now()
+    # China uses UTC+8; this also works on Windows without an installed tz database.
+    zone = timezone(timedelta(hours=8)) if MODEL_SCHEDULE_TIMEZONE == "Asia/Shanghai" else ZoneInfo(MODEL_SCHEDULE_TIMEZONE)
+    local_now = now or datetime.now(zone)
+    local_now = local_now.replace(tzinfo=zone) if local_now.tzinfo is None else local_now.astimezone(zone)
     current = local_now.timetz().replace(tzinfo=None)
     return any(start <= current < end for start, end in MODEL_V41_RESTRICTED_WINDOWS)
 

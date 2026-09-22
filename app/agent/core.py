@@ -320,7 +320,7 @@ _primary_key_lock = threading.Lock()  # [BUG FIX] 并发安全
 _llm_cache = {}  # cache_key -> {"instance": ChatOpenAI, "created_at": float}
 _LLM_CACHE_TTL = 900  # 15分钟，短于代理/服务端典型空闲超时（60-120s）
 
-def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override: str = None, 
+def _create_llm_client(deep_think: bool = False, fast_mode: bool = False, model_override: str = None, 
                short_response: bool = False):
     """创建 LLM 实例（启用 streaming 支持，支持备用Key自动切换）
     
@@ -371,7 +371,8 @@ def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override
     is_glm = model in GLM_MODELS
     
     # V4.1 使用独立密钥；普通 V4 Flash 始终使用旧 DEEPSEEK_API_KEY。
-    if model == MODEL_V41_FLASH:
+    is_official_deepseek = model == MODEL_V41_FLASH
+    if is_official_deepseek:
         api_key = settings.DEEPSEEK_V41_API_KEY
         base_url = settings.DEEPSEEK_V41_BASE_URL
         model = settings.DEEPSEEK_V41_MODEL
@@ -422,7 +423,7 @@ def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override
         request_timeout = 120
 
     # [优化1] 检查缓存，复用已有的 ChatOpenAI 实例（带 TTL 检查）
-    cache_key = (model, api_key, base_url, temperature)
+    cache_key = (model, api_key, base_url, temperature, max_tokens, request_timeout)
     if cache_key in _llm_cache:
         entry = _llm_cache[cache_key]
         if time.time() - entry["created_at"] < _LLM_CACHE_TTL:
@@ -447,6 +448,7 @@ def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override
         streaming=True,
         max_tokens=max_tokens,
         request_timeout=request_timeout,
+        **({"extra_body": {"thinking": {"type": "disabled"}}} if is_official_deepseek else {}),
         # [重要] 不设置 max_retries，避免超时时指数退避重试放大响应时间
         # 复杂任务（DFMEA等）LLM生成需要60-120s，重试会导致200-300s的卡死
     )
@@ -454,8 +456,19 @@ def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override
     logger.info(f"LLM Client 已创建并缓存: model={model}, max_tokens={max_tokens}, timeout={request_timeout}s, 缓存数量={len(_llm_cache)}")
     return llm
 
+def create_llm(deep_think=False, fast_mode=False, model_override=None, short_response=False):
+    from app.agent.model_routing import RoutedLLM
+    selected = model_override or settings.LLM_MODEL
+    options = dict(deep_think=deep_think, fast_mode=fast_mode, short_response=short_response)
+    if selected in {MODEL_V41_FLASH, MODEL_V4_FLASH}:
+        return RoutedLLM(_create_llm_client, selected, options)
+    return _create_llm_client(model_override=selected, **options)
+
+
 def _check_and_switch_to_backup(error_exception):
     """检测到401错误时，自动切换到备用Key"""
+    if settings.LLM_MODEL in {"DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash"}:
+        return False  # Independent providers are retried by RoutedLLM, not the global key switch.
     global _primary_key_failed
     error_str = str(error_exception).lower()
     if ("401" in error_str or "authentication" in error_str or "令牌" in error_str) and settings.LLM_API_KEY_BACKUP:

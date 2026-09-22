@@ -19,7 +19,7 @@ services:
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
       # DeepSeek V4.1（独立配额；普通 V4 Flash 仍使用上面的旧 Key）
       - DEEPSEEK_V41_API_KEY=${DEEPSEEK_V41_API_KEY}
-      - DEEPSEEK_V41_BASE_URL=${DEEPSEEK_V41_BASE_URL}
+      - DEEPSEEK_V41_BASE_URL=${DEEPSEEK_V41_BASE_URL:-https://api.deepseek.com}
       - DEEPSEEK_V41_MODEL=${DEEPSEEK_V41_MODEL:-deepseek-flash}
       # 千问（阿里云）
       - QWEN_API_KEY=${QWEN_API_KEY}
