@@ -111,7 +111,8 @@ class Settings:
     DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
     # DeepSeek V4.1 独立配置；不设置时不复用旧 V4 Flash 密钥，避免误用额度。
     DEEPSEEK_V41_API_KEY: str = os.getenv("DEEPSEEK_V41_API_KEY", "")
-    DEEPSEEK_V41_BASE_URL: str = os.getenv("DEEPSEEK_V41_BASE_URL", os.getenv("DEEPSEEK_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"))
+    DEEPSEEK_V41_BASE_URL: str = os.getenv("DEEPSEEK_V41_BASE_URL") or "https://api.deepseek.com"
+    DEEPSEEK_V41_MODEL: str = os.getenv("DEEPSEEK_V41_MODEL") or "deepseek-flash"
 
     # 千问独立配置（阿里云DashScope）
     QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "")

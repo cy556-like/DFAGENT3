@@ -100,7 +100,8 @@ LLM_MODEL=deepseek-chat
 DEEPSEEK_API_KEY=旧 V4 Flash 的 API Key
 DEEPSEEK_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
 DEEPSEEK_V41_API_KEY=V4.1 的 API Key
-DEEPSEEK_V41_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+DEEPSEEK_V41_BASE_URL=https://api.deepseek.com
+DEEPSEEK_V41_MODEL=deepseek-flash
 # 4.1 的时间路由按中国标准时间执行（可选）
 MODEL_SCHEDULE_TIMEZONE=Asia/Shanghai
 

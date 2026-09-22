@@ -374,6 +374,7 @@ def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override
     if model == MODEL_V41_FLASH:
         api_key = settings.DEEPSEEK_V41_API_KEY
         base_url = settings.DEEPSEEK_V41_BASE_URL
+        model = settings.DEEPSEEK_V41_MODEL
         logger.info(f"DeepSeek V4.1 模型检测到，使用 V4.1 专用 API: {base_url}")
     elif is_volcengine and settings.DEEPSEEK_API_KEY:
         api_key = settings.DEEPSEEK_API_KEY
