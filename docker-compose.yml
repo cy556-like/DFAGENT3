@@ -10,13 +10,16 @@ services:
       # 主 LLM 配置
       - LLM_API_KEY=${LLM_API_KEY}
       - LLM_BASE_URL=${LLM_BASE_URL}
-      - LLM_MODEL=${LLM_MODEL}
+      - LLM_MODEL=${LLM_MODEL:-DeepSeek-V4.1-Flash}
       # 备用 LLM 配置
       - LLM_API_KEY_BACKUP=${LLM_API_KEY_BACKUP}
       - LLM_BASE_URL_BACKUP=${LLM_BASE_URL_BACKUP}
       # DeepSeek / 豆包（火山引擎）
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
+      # DeepSeek V4.1（独立配额；普通 V4 Flash 仍使用上面的旧 Key）
+      - DEEPSEEK_V41_API_KEY=${DEEPSEEK_V41_API_KEY}
+      - DEEPSEEK_V41_BASE_URL=${DEEPSEEK_V41_BASE_URL}
       # 千问（阿里云）
       - QWEN_API_KEY=${QWEN_API_KEY}
       - QWEN_BASE_URL=${QWEN_BASE_URL}

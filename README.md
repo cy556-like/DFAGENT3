@@ -95,6 +95,15 @@ LLM_API_KEY=sk-xxxxxxxxxxxxxxxx
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
 
+# DeepSeek 模型下拉项显示为 V4.1；请单独配置 V4.1 密钥。
+# 普通 V4 Flash 仍使用 DEEPSEEK_API_KEY，不能共用此配置。
+DEEPSEEK_API_KEY=旧 V4 Flash 的 API Key
+DEEPSEEK_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+DEEPSEEK_V41_API_KEY=V4.1 的 API Key
+DEEPSEEK_V41_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+# 4.1 的时间路由按中国标准时间执行（可选）
+MODEL_SCHEDULE_TIMEZONE=Asia/Shanghai
+
 # 或使用 OpenAI
 # LLM_API_KEY=sk-xxxxxxxxxxxxxxxx
 # LLM_BASE_URL=https://api.openai.com/v1
@@ -207,6 +216,8 @@ docker-compose down
      - `LLM_API_KEY` = 你的 API Key
      - `LLM_BASE_URL` = https://api.deepseek.com/v1
      - `LLM_MODEL` = deepseek-chat
+     - `DEEPSEEK_API_KEY` = 原 V4 Flash API Key
+     - `DEEPSEEK_V41_API_KEY` = V4.1 API Key
 5. 点击 **Deploy**，等待部署完成
 6. 获得 `https://your-agent.onrender.com` 地址
 

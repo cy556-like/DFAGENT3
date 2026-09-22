@@ -29,7 +29,12 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from app.config import settings, VISION_MODELS, DEFAULT_VISION_MODEL, VISION_API_KEY, VISION_BASE_URL, FAST_MODELS, DEEPSEEK_MODELS, VOLCENGINE_MODELS, QWEN_MODELS, MIMO_MODELS, GLM_MODELS
+from app.config import (
+    settings, VISION_MODELS, DEFAULT_VISION_MODEL, VISION_API_KEY, VISION_BASE_URL,
+    FAST_MODELS, DEEPSEEK_MODELS, VOLCENGINE_MODELS, QWEN_MODELS, MIMO_MODELS,
+    GLM_MODELS, MODEL_V4_FLASH, MODEL_V41_FLASH, resolve_effective_model,
+    get_model_fallbacks,
+)
 from app.agent.tools import ALL_TOOLS, get_tools, set_current_agent_id, set_current_session_id, get_current_session_id, reset_search_count
 from app.agent.prompts import SYSTEM_PROMPT, SYSTEM_PROMPT_WITH_WEB_SEARCH, CHAT_SYSTEM_PROMPT, get_agent_keywords_section
 from app.memory.manager import get_session_history
@@ -330,7 +335,8 @@ def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override
         short_response: 是否为短回复场景（降低 max_tokens 加速推理）
     """
     global _primary_key_failed
-    model = model_override or settings.LLM_MODEL
+    selected_model = model_override or settings.LLM_MODEL
+    model = selected_model
     
     if fast_mode and not model_override:
         # 从 FAST_MODELS 配置中选取快速模型（如当前模型已是快速模型则不切换）
@@ -342,6 +348,12 @@ def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override
             logger.info(f"快速模式：当前模型 {model} 已是快速模型，无需切换")
     # deep_think 不再切换模型：用户已主动选择模型，深度思考只需调整 temperature 和 max_tokens
     # 旧代码会强制切换到已失效的 glm-4-plus 等模型，导致 API 调用失败
+
+    # 4.1 的前端选择保持不变，但在指定时段实际调用原 V4 Flash。
+    effective_model = resolve_effective_model(model)
+    if effective_model != model:
+        logger.info(f"模型时段路由：{model} → {effective_model}（当前时段不使用 V4.1 配额）")
+        model = effective_model
 
     # 决定使用主Key还是备用Key（用锁保护并发读写）
     with _primary_key_lock:
@@ -358,7 +370,12 @@ def create_llm(deep_think: bool = False, fast_mode: bool = False, model_override
     # [GLM] 检测是否为GLM模型，使用阿里云百炼平台（兼容模式代理智谱模型）
     is_glm = model in GLM_MODELS
     
-    if is_volcengine and settings.DEEPSEEK_API_KEY:
+    # V4.1 使用独立密钥；普通 V4 Flash 始终使用旧 DEEPSEEK_API_KEY。
+    if model == MODEL_V41_FLASH:
+        api_key = settings.DEEPSEEK_V41_API_KEY
+        base_url = settings.DEEPSEEK_V41_BASE_URL
+        logger.info(f"DeepSeek V4.1 模型检测到，使用 V4.1 专用 API: {base_url}")
+    elif is_volcengine and settings.DEEPSEEK_API_KEY:
         api_key = settings.DEEPSEEK_API_KEY
         base_url = settings.DEEPSEEK_BASE_URL
         logger.info(f"火山引擎模型检测到（{model}），使用火山引擎 Coding API: {base_url}")
@@ -517,7 +534,7 @@ class ParallelToolNode:
         return {"messages": all_tool_messages}
 
 
-def create_agent_graph(web_search: bool = False):
+def create_agent_graph(web_search: bool = False, model_override: str = None):
     """
     构建 LangGraph Agent 执行图
 
@@ -528,7 +545,7 @@ def create_agent_graph(web_search: bool = False):
            ├─ 是 → 执行工具 → 回到 LLM 思考（循环，最多8轮）
            └─ 否 → 输出回答 → 结束
     """
-    llm = create_llm()
+    llm = create_llm(model_override=model_override)
     tools = get_tools(web_search=web_search)
     llm_with_tools = llm.bind_tools(tools)
     system_prompt = SYSTEM_PROMPT_WITH_WEB_SEARCH if web_search else SYSTEM_PROMPT
@@ -780,7 +797,7 @@ def _build_chat_prompt(agent_task: str) -> str:
 _agent_prompt_graph_cache = {}  # cache_key -> compiled graph
 _AGENT_PROMPT_CACHE_MAX_SIZE = 8  # 最多缓存 8 个不同的自定义 Agent 图
 
-def get_agent_with_prompt(custom_system_prompt: str, web_search: bool = False):
+def get_agent_with_prompt(custom_system_prompt: str, web_search: bool = False, model_override: str = None):
     """获取带有自定义系统提示词的 Agent 实例
     
     [优化2] 按 prompt hash + web_search 缓存编译后的 Agent Graph，
@@ -789,14 +806,14 @@ def get_agent_with_prompt(custom_system_prompt: str, web_search: bool = False):
     """
     # 生成缓存 key
     prompt_hash = hashlib.md5(custom_system_prompt.encode()).hexdigest()[:16]
-    cache_key = f"{prompt_hash}:{web_search}"
+    cache_key = f"{prompt_hash}:{web_search}:{model_override or settings.LLM_MODEL}"
     
     if cache_key in _agent_prompt_graph_cache:
         logger.debug(f"Agent Graph 缓存命中: prompt_hash={prompt_hash}, web_search={web_search}")
         _agent_prompt_graph_timestamps[cache_key] = time.time()  # [性能修复] 更新访问时间
         return _agent_prompt_graph_cache[cache_key]
     
-    llm = create_llm()
+    llm = create_llm(model_override=model_override)
     tools = get_tools(web_search=web_search)
     llm_with_tools = llm.bind_tools(tools)
 
@@ -881,7 +898,24 @@ def chat(user_input: str, session_id: str = "default", web_search: bool = False,
         recent_messages = history.messages[-MAX_HISTORY_MESSAGES:]
         all_messages = recent_messages + [HumanMessage(content=user_input)]
         chat_prompt = _inject_current_date(_build_chat_prompt(agent_task) if agent_task else CHAT_SYSTEM_PROMPT)
-        result = llm.invoke([SystemMessage(content=chat_prompt)] + all_messages)
+        try:
+            result = llm.invoke([SystemMessage(content=chat_prompt)] + all_messages)
+        except Exception as first_error:
+            if not _is_model_capacity_error(first_error):
+                raise
+            result = None
+            for fallback_model in get_model_fallbacks(settings.LLM_MODEL):
+                try:
+                    _log_model_fallback(settings.LLM_MODEL, fallback_model, first_error)
+                    result = create_llm(deep_think=deep_think, model_override=fallback_model).invoke(
+                        [SystemMessage(content=chat_prompt)] + all_messages
+                    )
+                    break
+                except Exception as fallback_error:
+                    if not _is_model_capacity_error(fallback_error):
+                        raise
+            if result is None:
+                raise first_error
         full_response = result.content
         history.add_message(HumanMessage(content=user_input))
         history.add_message(AIMessage(content=full_response))
@@ -891,7 +925,23 @@ def chat(user_input: str, session_id: str = "default", web_search: bool = False,
     history = get_session_history(session_id)
     recent_messages = history.messages[-MAX_HISTORY_MESSAGES:]
     all_messages = recent_messages + [HumanMessage(content=user_input)]
-    result = agent.invoke({"messages": all_messages, "retry_count": 0})
+    try:
+        result = agent.invoke({"messages": all_messages, "retry_count": 0})
+    except Exception as first_error:
+        if not _is_model_capacity_error(first_error):
+            raise
+        result = None
+        for fallback_model in get_model_fallbacks(settings.LLM_MODEL):
+            try:
+                _log_model_fallback(settings.LLM_MODEL, fallback_model, first_error)
+                fallback_agent = create_agent_graph(web_search=web_search, model_override=fallback_model)
+                result = fallback_agent.invoke({"messages": all_messages, "retry_count": 0})
+                break
+            except Exception as fallback_error:
+                if not _is_model_capacity_error(fallback_error):
+                    raise
+        if result is None:
+            raise first_error
     ai_message = result["messages"][-1]
     history.add_message(HumanMessage(content=user_input))
     history.add_message(ai_message)
@@ -934,6 +984,27 @@ def _extract_content(chunk) -> str:
                 text_parts.append(item)
         return ''.join(text_parts)
     return ''
+
+
+# 额度不足/限流类错误可以安全切换模型；认证错误仍由备用 Key 逻辑单独处理。
+_MODEL_CAPACITY_ERROR_MARKERS = (
+    "429", "rate limit", "ratelimit", "too many requests", "quota", "insufficient",
+    "余额", "额度", "超出限制", "resource exhausted", "billing", "capacity",
+)
+
+
+def _is_model_capacity_error(error: Exception) -> bool:
+    error_text = str(error).lower()
+    return any(marker in error_text for marker in _MODEL_CAPACITY_ERROR_MARKERS)
+
+
+def _log_model_fallback(selected_model: str, fallback_model: str, error: Exception):
+    logger.warning(
+        "模型 %s 额度/限流不足，自动切换到 %s：%s",
+        selected_model,
+        fallback_model,
+        str(error)[:500],
+    )
 
 # [BUG FIX] 整体超时保护：Agent 对话最大允许时长（秒）
 # 超过此时间强制结束，避免 LLM API 挂起导致服务器无响应需 Ctrl+C
@@ -1085,25 +1156,63 @@ async def chat_stream_generator(user_input: str, session_id: str = "default", we
             yield {"type": "done"}
             _cleanup_session_cancel(session_id)
             return
-        try:
-            result = await asyncio.wait_for(
-                agent.ainvoke({"messages": all_messages, "retry_count": 0}),
-                timeout=60.0  # [BUG FIX] 非流式回退也加超时
-            )
-            ai_message = result["messages"][-1]
-            full_response = ai_message.content or ""
-            if full_response:
-                for i in range(0, len(full_response), 3):
-                    yield {"type": "token", "content": full_response[i:i+3]}
-                    await asyncio.sleep(0.02)
-        except asyncio.TimeoutError:
-            yield {"type": "error", "content": "非流式回退也超时，请稍后重试"}
-            yield {"type": "done"}
-            return
-        except Exception as e2:
-            yield {"type": "error", "content": f"处理失败: {str(e2)}"}
-            yield {"type": "done"}
-            return
+        if _is_model_capacity_error(e):
+            # 额度不足时重建一个绑定备用模型的 Agent，避免重复调用已耗尽的模型。
+            # 当前 Agent 的取消事件在异常处理中已置位，重试前为同一会话创建新的事件。
+            _get_or_create_cancel_event(session_id)
+            for fallback_model in get_model_fallbacks(settings.LLM_MODEL):
+                try:
+                    _log_model_fallback(settings.LLM_MODEL, fallback_model, e)
+                    fallback_agent = get_agent_with_prompt(
+                        custom_system_prompt,
+                        web_search=web_search,
+                        model_override=fallback_model,
+                    )
+                    yield {"type": "thinking", "content": f"当前模型额度不足，已切换到 {fallback_model} 重试..."}
+                    result = await asyncio.wait_for(
+                        fallback_agent.ainvoke({"messages": all_messages, "retry_count": 0}),
+                        timeout=60.0,
+                    )
+                    ai_message = result["messages"][-1]
+                    full_response = ai_message.content or ""
+                    if full_response:
+                        for i in range(0, len(full_response), 3):
+                            yield {"type": "token", "content": full_response[i:i+3]}
+                            await asyncio.sleep(0.02)
+                        break
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as fallback_error:
+                    if not _is_model_capacity_error(fallback_error):
+                        yield {"type": "error", "content": f"处理失败: {str(fallback_error)}"}
+                        yield {"type": "done"}
+                        _cleanup_session_cancel(session_id)
+                        return
+            if not full_response:
+                yield {"type": "error", "content": "当前模型额度不足，备用模型也暂时不可用，请稍后重试"}
+                yield {"type": "done"}
+                _cleanup_session_cancel(session_id)
+                return
+        else:
+            try:
+                result = await asyncio.wait_for(
+                    agent.ainvoke({"messages": all_messages, "retry_count": 0}),
+                    timeout=60.0  # [BUG FIX] 非流式回退也加超时
+                )
+                ai_message = result["messages"][-1]
+                full_response = ai_message.content or ""
+                if full_response:
+                    for i in range(0, len(full_response), 3):
+                        yield {"type": "token", "content": full_response[i:i+3]}
+                        await asyncio.sleep(0.02)
+            except asyncio.TimeoutError:
+                yield {"type": "error", "content": "非流式回退也超时，请稍后重试"}
+                yield {"type": "done"}
+                return
+            except Exception as e2:
+                yield {"type": "error", "content": f"处理失败: {str(e2)}"}
+                yield {"type": "done"}
+                return
 
     # 流式输出为空时回退到非流式
     if not full_response:
@@ -1199,8 +1308,38 @@ async def _chat_mode_stream(user_input: str, session_id: str = "default", deep_t
         if _check_and_switch_to_backup(e):
             yield {"type": "error", "content": "主API Key已失效，已自动切换到备用Key，请重新提问"}
             return
-        yield {"type": "error", "content": f"处理失败: {str(e)}"}
-        return
+        if _is_model_capacity_error(e):
+            fallback_response = ""
+            for fallback_model in get_model_fallbacks(settings.LLM_MODEL):
+                try:
+                    _log_model_fallback(settings.LLM_MODEL, fallback_model, e)
+                    fallback_llm = create_llm(
+                        deep_think=deep_think,
+                        model_override=fallback_model,
+                        short_response=is_simple,
+                    )
+                    yield {"type": "thinking", "content": f"当前模型额度不足，已切换到 {fallback_model} 重试..."}
+                    async for chunk in fallback_llm.astream([SystemMessage(content=chat_system_prompt)] + all_messages):
+                        content = _extract_content(chunk)
+                        if content:
+                            fallback_response += content
+                            yield {"type": "token", "content": content}
+                    if fallback_response:
+                        full_response = fallback_response
+                        break
+                except Exception as fallback_error:
+                    if not _is_model_capacity_error(fallback_error):
+                        yield {"type": "error", "content": f"处理失败: {str(fallback_error)}"}
+                        return
+            if full_response:
+                # 继续走统一的历史记录与 done 事件路径。
+                pass
+            else:
+                yield {"type": "error", "content": "当前模型额度不足，备用模型也暂时不可用，请稍后重试"}
+                return
+        else:
+            yield {"type": "error", "content": f"处理失败: {str(e)}"}
+            return
 
     if full_response:
         try:

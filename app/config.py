@@ -7,6 +7,8 @@
 """
 import os
 import logging
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -19,7 +21,8 @@ if not load_dotenv(_env_path):
 # 可用的 LLM 模型列表
 AVAILABLE_MODELS = [
     # DeepSeek 系列（火山引擎）
-    {"id": "DeepSeek-V4-Flash", "name": "DeepSeek-V4-Flash", "desc": "DeepSeek快速版，性价比高"},
+    # 前端只展示 4.1；在受限时间段由 resolve_effective_model() 路由到原 V4 Flash。
+    {"id": "DeepSeek-V4.1-Flash", "name": "DeepSeek-V4.1-Flash", "desc": "DeepSeek V4.1 Flash（按时段自动路由）"},
     # GLM 系列（火山引擎Ark，与豆包/DeepSeek共用套餐）
     {"id": "glm-5.2", "name": "GLM-5.2", "desc": "GLM旗舰，火山引擎Ark"},
     # 豆包系列（火山引擎）
@@ -40,13 +43,46 @@ VISION_API_KEY: str = os.getenv("VISION_API_KEY", os.getenv("LLM_API_KEY", ""))
 VISION_BASE_URL: str = os.getenv("VISION_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 
 # 快速模型列表（用于意图路由，加速简单问题的响应）
-FAST_MODELS = {"DeepSeek-V4-Flash"}
+MODEL_V4_FLASH = "DeepSeek-V4-Flash"
+MODEL_V41_FLASH = "DeepSeek-V4.1-Flash"
+
+# 快速模型列表（用于意图路由，加速简单问题的响应）
+FAST_MODELS = {MODEL_V4_FLASH, MODEL_V41_FLASH}
 
 # 火山引擎模型列表（走火山引擎Ark Coding API，包括豆包/DeepSeek/GLM）
-VOLCENGINE_MODELS = {"DeepSeek-V4-Flash", "Doubao-Seed-2.0-pro", "glm-5.2"}
+VOLCENGINE_MODELS = {MODEL_V4_FLASH, MODEL_V41_FLASH, "Doubao-Seed-2.0-pro", "glm-5.2"}
 
 # DeepSeek 模型列表（兼容旧代码引用，走火山引擎Coding API）
-DEEPSEEK_MODELS = {"DeepSeek-V4-Flash"}
+DEEPSEEK_MODELS = {MODEL_V4_FLASH, MODEL_V41_FLASH}
+
+# 4.1 在以下时间段不调用 4.1 配额，改走原 V4 Flash。时间按中国标准时间解释。
+MODEL_SCHEDULE_TIMEZONE = os.getenv("MODEL_SCHEDULE_TIMEZONE", "Asia/Shanghai")
+MODEL_V41_RESTRICTED_WINDOWS = ((dt_time(9, 0), dt_time(12, 0)), (dt_time(14, 0), dt_time(18, 0)))
+
+
+def is_v41_restricted_time(now: datetime | None = None) -> bool:
+    """判断当前是否处于 4.1 的受限时段（左闭右开）。"""
+    try:
+        local_now = (now or datetime.now(ZoneInfo(MODEL_SCHEDULE_TIMEZONE)))
+    except Exception:
+        # 时区配置错误时保持服务可用，退回服务器本地时间。
+        local_now = now or datetime.now()
+    current = local_now.timetz().replace(tzinfo=None)
+    return any(start <= current < end for start, end in MODEL_V41_RESTRICTED_WINDOWS)
+
+
+def resolve_effective_model(model_id: str, now: datetime | None = None) -> str:
+    """将前端选择的模型解析为本次请求实际调用的模型。"""
+    if model_id == MODEL_V41_FLASH and is_v41_restricted_time(now):
+        return MODEL_V4_FLASH
+    return model_id
+
+
+def get_model_fallbacks(model_id: str) -> list[str]:
+    """返回额度不足时的降级顺序，不改变前端当前选择。"""
+    order = [MODEL_V4_FLASH, "glm-5.2", "Doubao-Seed-2.0-pro", "qwen3.7-plus", "mimo-v2.5-pro"]
+    effective = resolve_effective_model(model_id)
+    return [candidate for candidate in order if candidate not in {model_id, effective}]
 
 # 千问模型列表（走阿里云DashScope API）
 QWEN_MODELS = {"qwen3.7-plus"}
@@ -64,7 +100,7 @@ class Settings:
     # LLM 默认配置（阿里云百炼平台，兼容模式代理多家模型）
     LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
     LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "glm-5.2")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", MODEL_V41_FLASH)
 
     # LLM 备用配置（主Key失效时自动切换）
     LLM_API_KEY_BACKUP: str = os.getenv("LLM_API_KEY_BACKUP", "")
@@ -73,6 +109,9 @@ class Settings:
     # DeepSeek / 豆包 独立配置（火山引擎Ark）
     DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", os.getenv("LLM_API_KEY", ""))
     DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
+    # DeepSeek V4.1 独立配置；不设置时不复用旧 V4 Flash 密钥，避免误用额度。
+    DEEPSEEK_V41_API_KEY: str = os.getenv("DEEPSEEK_V41_API_KEY", "")
+    DEEPSEEK_V41_BASE_URL: str = os.getenv("DEEPSEEK_V41_BASE_URL", os.getenv("DEEPSEEK_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3"))
 
     # 千问独立配置（阿里云DashScope）
     QWEN_API_KEY: str = os.getenv("QWEN_API_KEY", "")
