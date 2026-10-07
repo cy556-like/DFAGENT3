@@ -357,24 +357,13 @@ def create_chat(username: str, title: str = "新对话", mode: str = "agent", ag
     Returns:
         dict: 包含 chat_id、title 和 mode
 
-    当同一智能体下的会话数超过 MAX_CHATS_PER_AGENT 时，自动删除最老的会话
+    新建会话保留已有历史；仅显式删除或演示账号保留策略可删除历史
     """
     chat_id = f"{username}_{uuid.uuid4().hex[:8]}"
     chats = _load_user_chats(username)
 
-    # 自动淘汰：如果指定了 agent_id，检查该智能体下已有会话数
-    if agent_id:
-        agent_chats = [c for c in chats if c.get("agent_id") == agent_id]
-        if len(agent_chats) >= MAX_CHATS_PER_AGENT:
-            # 按 updated_at 升序排列，最老的在前面
-            agent_chats_sorted = sorted(agent_chats, key=lambda x: x.get("updated_at", 0))
-            to_remove_count = len(agent_chats) - MAX_CHATS_PER_AGENT + 1  # +1 因为还要新建一个
-            for old_chat in agent_chats_sorted[:to_remove_count]:
-                old_chat_id = old_chat["chat_id"]
-                chats = [c for c in chats if c["chat_id"] != old_chat_id]
-                # 同时清理对话历史文件和内存缓存
-                clear_session_history(old_chat_id)
-                logger.info(f"智能体 [{agent_id}] 会话数达上限({MAX_CHATS_PER_AGENT})，自动淘汰旧会话: {old_chat_id}")
+    # Creating a new chat must never delete a running or saved conversation.
+    # Explicit deletion/demo-retention remains the only removal path.
 
     chat_info = {
         "chat_id": chat_id,

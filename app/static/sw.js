@@ -4,7 +4,7 @@
  * 版本: 1.0.0
  */
 
-const CACHE_NAME = 'docagent-v1.0.0';
+const CACHE_NAME = 'dfagent3-20261008-account-provider';
 const STATIC_CACHE = 'docagent-static-v1.0.0';
 const DYNAMIC_CACHE = 'docagent-dynamic-v1.0.0';
 

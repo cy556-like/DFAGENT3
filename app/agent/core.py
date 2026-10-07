@@ -1,3 +1,5 @@
+from app.request_models import get_active_model
+from app.config import get_model_connection, normalize_model_id
 """
 Agent 核心逻辑模块
 使用 LangGraph 构建 ReAct 模式的 Agent
@@ -321,7 +323,7 @@ _llm_cache = {}  # cache_key -> {"instance": ChatOpenAI, "created_at": float}
 _LLM_CACHE_TTL = 900  # 15分钟，短于代理/服务端典型空闲超时（60-120s）
 
 def _create_llm_client(deep_think: bool = False, fast_mode: bool = False, model_override: str = None, 
-               short_response: bool = False):
+               short_response: bool = False, force_backup=False, resolved_model=False):
     """创建 LLM 实例（启用 streaming 支持，支持备用Key自动切换）
     
     [优化1] 使用缓存：按 (model, api_key, base_url, temperature) 作为缓存 key，
@@ -335,8 +337,8 @@ def _create_llm_client(deep_think: bool = False, fast_mode: bool = False, model_
         short_response: 是否为短回复场景（降低 max_tokens 加速推理）
     """
     global _primary_key_failed
-    selected_model = model_override or settings.LLM_MODEL
-    model = selected_model
+    selected_model = model_override or get_active_model()
+    model = normalize_model_id(selected_model) if resolved_model else resolve_effective_model(selected_model)
     
     if fast_mode and not model_override:
         # 从 FAST_MODELS 配置中选取快速模型（如当前模型已是快速模型则不切换）
@@ -349,58 +351,17 @@ def _create_llm_client(deep_think: bool = False, fast_mode: bool = False, model_
     # deep_think 不再切换模型：用户已主动选择模型，深度思考只需调整 temperature 和 max_tokens
     # 旧代码会强制切换到已失效的 glm-4-plus 等模型，导致 API 调用失败
 
-    # 4.1 的前端选择保持不变，但在指定时段实际调用原 V4 Flash。
-    effective_model = resolve_effective_model(model)
-    if effective_model != model:
-        logger.info(f"模型时段路由：{model} → {effective_model}（当前时段不使用 V4.1 配额）")
-        model = effective_model
-
-    # 决定使用主Key还是备用Key（用锁保护并发读写）
-    with _primary_key_lock:
-        use_backup = _primary_key_failed and bool(settings.LLM_API_KEY_BACKUP)
-    
-    # [DeepSeek] 检测是否为 DeepSeek 模型，自动切换火山引擎 API
-    is_deepseek = model in DEEPSEEK_MODELS
-    # [豆包] 检测是否为火山引擎模型（豆包Auto/DeepSeek/豆包），使用火山引擎 Coding API
-    is_volcengine = model in VOLCENGINE_MODELS
-    # [千问] 检测是否为千问模型，使用阿里云 DashScope API
-    is_qwen = model in QWEN_MODELS
-    # [MiMo] 检测是否为MiMo模型，使用小米API
-    is_mimo = model in MIMO_MODELS
-    # [GLM] 检测是否为GLM模型，使用阿里云百炼平台（兼容模式代理智谱模型）
-    is_glm = model in GLM_MODELS
-    
-    # V4.1 使用独立密钥；普通 V4 Flash 始终使用旧 DEEPSEEK_API_KEY。
-    is_official_deepseek = model == MODEL_V41_FLASH
+    use_backup = bool(force_backup)
+    if use_backup:
+        from app.config import ARK_BACKUP_MODEL
+        model = ARK_BACKUP_MODEL
+    is_kimi = model == "kimi-k3"
+    is_official_deepseek = model == "DeepSeek-V4.1-Flash"
+    api_key, base_url = get_model_connection(model, backup=use_backup)
+    if not api_key or not base_url:
+        raise RuntimeError(f"模型 {model} 未配置对应的 API Key/地址")
     if is_official_deepseek:
-        api_key = settings.DEEPSEEK_V41_API_KEY
-        base_url = settings.DEEPSEEK_V41_BASE_URL
         model = settings.DEEPSEEK_V41_MODEL
-        logger.info(f"DeepSeek V4.1 模型检测到，使用 V4.1 专用 API: {base_url}")
-    elif is_volcengine and settings.DEEPSEEK_API_KEY:
-        api_key = settings.DEEPSEEK_API_KEY
-        base_url = settings.DEEPSEEK_BASE_URL
-        logger.info(f"火山引擎模型检测到（{model}），使用火山引擎 Coding API: {base_url}")
-    elif is_qwen and settings.QWEN_API_KEY:
-        api_key = settings.QWEN_API_KEY
-        base_url = settings.QWEN_BASE_URL
-        logger.info(f"千问模型检测到（{model}），使用阿里云 DashScope API: {base_url}")
-    elif is_mimo and settings.MIMO_API_KEY:
-        api_key = settings.MIMO_API_KEY
-        base_url = settings.MIMO_BASE_URL
-        logger.info(f"MiMo模型检测到（{model}），使用小米MiMo API: {base_url}")
-    elif is_glm and settings.GLM_API_KEY:
-        api_key = settings.GLM_API_KEY
-        base_url = settings.GLM_BASE_URL
-        logger.info(f"GLM模型检测到（{model}），使用火山引擎Ark: {base_url}")
-    # [视觉模型] 无论当前选什么模型，视觉理解始终走智谱AI专用配置
-    elif model in VISION_MODELS:
-        api_key = VISION_API_KEY
-        base_url = VISION_BASE_URL
-        logger.info(f"视觉模型检测到（{model}），使用智谱AI视觉专用API: {base_url}")
-    else:
-        api_key = settings.LLM_API_KEY_BACKUP if use_backup else settings.LLM_API_KEY
-        base_url = settings.LLM_BASE_URL_BACKUP if use_backup else settings.LLM_BASE_URL
     temperature = 0.7 if deep_think else 0.6
     
     # 智能 max_tokens：保证模型有足够输出空间，避免回答被截断
@@ -458,25 +419,13 @@ def _create_llm_client(deep_think: bool = False, fast_mode: bool = False, model_
 
 def create_llm(deep_think=False, fast_mode=False, model_override=None, short_response=False):
     from app.agent.model_routing import RoutedLLM
-    selected = model_override or settings.LLM_MODEL
+    selected = model_override or get_active_model()
     options = dict(deep_think=deep_think, fast_mode=fast_mode, short_response=short_response)
-    if selected in {MODEL_V41_FLASH, MODEL_V4_FLASH}:
-        return RoutedLLM(_create_llm_client, selected, options)
-    return _create_llm_client(model_override=selected, **options)
+    return RoutedLLM(_create_llm_client, selected, options)
 
 
 def _check_and_switch_to_backup(error_exception):
-    """检测到401错误时，自动切换到备用Key"""
-    if settings.LLM_MODEL in {"DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash"}:
-        return False  # Independent providers are retried by RoutedLLM, not the global key switch.
-    global _primary_key_failed
-    error_str = str(error_exception).lower()
-    if ("401" in error_str or "authentication" in error_str or "令牌" in error_str) and settings.LLM_API_KEY_BACKUP:
-        with _primary_key_lock:
-            if not _primary_key_failed:
-                _primary_key_failed = True
-                logger.warning(f"⚠️ 主API Key认证失败(401)，已自动切换到备用Key: {settings.LLM_BASE_URL_BACKUP}")
-        return True
+    # Fallback is performed by RoutedLLM within this request, never by a global flag.
     return False
 
 def reset_primary_key():
@@ -626,12 +575,8 @@ _agent_graph = None
 _agent_web_search = False
 
 def get_agent(web_search: bool = False):
-    """获取 Agent 实例（懒加载，根据 web_search 参数决定是否包含联网搜索工具）"""
-    global _agent_graph, _agent_web_search
-    if _agent_graph is None or _agent_web_search != web_search:
-        _agent_graph = create_agent_graph(web_search=web_search)
-        _agent_web_search = web_search
-    return _agent_graph
+    # Prompt/model-keyed cache avoids capturing the first logged-in user's choice.
+    return get_agent_with_prompt(SYSTEM_PROMPT, web_search=web_search, model_override=get_active_model())
 
 def reset_agent():
     """重置 Agent 实例（切换模型后调用，下次对话会自动重建）
@@ -820,7 +765,7 @@ def get_agent_with_prompt(custom_system_prompt: str, web_search: bool = False, m
     """
     # 生成缓存 key
     prompt_hash = hashlib.md5(custom_system_prompt.encode()).hexdigest()[:16]
-    cache_key = f"{prompt_hash}:{web_search}:{model_override or settings.LLM_MODEL}"
+    cache_key = f"{prompt_hash}:{web_search}:{model_override or get_active_model()}"
     
     if cache_key in _agent_prompt_graph_cache:
         logger.debug(f"Agent Graph 缓存命中: prompt_hash={prompt_hash}, web_search={web_search}")
@@ -912,24 +857,7 @@ def chat(user_input: str, session_id: str = "default", web_search: bool = False,
         recent_messages = history.messages[-MAX_HISTORY_MESSAGES:]
         all_messages = recent_messages + [HumanMessage(content=user_input)]
         chat_prompt = _inject_current_date(_build_chat_prompt(agent_task) if agent_task else CHAT_SYSTEM_PROMPT)
-        try:
-            result = llm.invoke([SystemMessage(content=chat_prompt)] + all_messages)
-        except Exception as first_error:
-            if not _is_model_capacity_error(first_error):
-                raise
-            result = None
-            for fallback_model in get_model_fallbacks(settings.LLM_MODEL):
-                try:
-                    _log_model_fallback(settings.LLM_MODEL, fallback_model, first_error)
-                    result = create_llm(deep_think=deep_think, model_override=fallback_model).invoke(
-                        [SystemMessage(content=chat_prompt)] + all_messages
-                    )
-                    break
-                except Exception as fallback_error:
-                    if not _is_model_capacity_error(fallback_error):
-                        raise
-            if result is None:
-                raise first_error
+        result = llm.invoke([SystemMessage(content=chat_prompt)] + all_messages)
         full_response = result.content
         history.add_message(HumanMessage(content=user_input))
         history.add_message(AIMessage(content=full_response))
@@ -939,23 +867,7 @@ def chat(user_input: str, session_id: str = "default", web_search: bool = False,
     history = get_session_history(session_id)
     recent_messages = history.messages[-MAX_HISTORY_MESSAGES:]
     all_messages = recent_messages + [HumanMessage(content=user_input)]
-    try:
-        result = agent.invoke({"messages": all_messages, "retry_count": 0})
-    except Exception as first_error:
-        if not _is_model_capacity_error(first_error):
-            raise
-        result = None
-        for fallback_model in get_model_fallbacks(settings.LLM_MODEL):
-            try:
-                _log_model_fallback(settings.LLM_MODEL, fallback_model, first_error)
-                fallback_agent = create_agent_graph(web_search=web_search, model_override=fallback_model)
-                result = fallback_agent.invoke({"messages": all_messages, "retry_count": 0})
-                break
-            except Exception as fallback_error:
-                if not _is_model_capacity_error(fallback_error):
-                    raise
-        if result is None:
-            raise first_error
+    result = agent.invoke({"messages": all_messages, "retry_count": 0})
     ai_message = result["messages"][-1]
     history.add_message(HumanMessage(content=user_input))
     history.add_message(ai_message)
@@ -1157,76 +1069,15 @@ async def chat_stream_generator(user_input: str, session_id: str = "default", we
         _cleanup_session_cancel(session_id)
         return
     except Exception as e:
-        # [BUG FIX v6] 异常时也设置取消信号，避免后续 think() 继续浪费调用
         _set_session_cancelled(session_id)
-        logger.error(f"Agent 流式输出异常: {e}", exc_info=True)
-        # [BUG FIX] 异常时：先发送未完成工具的 tool_done
         for tool_name, display_name in pending_tools.items():
             yield {"type": "tool_done", "name": tool_name, "display": display_name}
         pending_tools.clear()
-        # 检测401认证错误，自动切换备用Key
-        if _check_and_switch_to_backup(e):
-            yield {"type": "error", "content": "主API Key已失效，已自动切换到备用Key，请重新提问"}
-            yield {"type": "done"}
-            _cleanup_session_cancel(session_id)
-            return
-        if _is_model_capacity_error(e):
-            # 额度不足时重建一个绑定备用模型的 Agent，避免重复调用已耗尽的模型。
-            # 当前 Agent 的取消事件在异常处理中已置位，重试前为同一会话创建新的事件。
-            _get_or_create_cancel_event(session_id)
-            for fallback_model in get_model_fallbacks(settings.LLM_MODEL):
-                try:
-                    _log_model_fallback(settings.LLM_MODEL, fallback_model, e)
-                    fallback_agent = get_agent_with_prompt(
-                        custom_system_prompt,
-                        web_search=web_search,
-                        model_override=fallback_model,
-                    )
-                    yield {"type": "thinking", "content": f"当前模型额度不足，已切换到 {fallback_model} 重试..."}
-                    result = await asyncio.wait_for(
-                        fallback_agent.ainvoke({"messages": all_messages, "retry_count": 0}),
-                        timeout=60.0,
-                    )
-                    ai_message = result["messages"][-1]
-                    full_response = ai_message.content or ""
-                    if full_response:
-                        for i in range(0, len(full_response), 3):
-                            yield {"type": "token", "content": full_response[i:i+3]}
-                            await asyncio.sleep(0.02)
-                        break
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as fallback_error:
-                    if not _is_model_capacity_error(fallback_error):
-                        yield {"type": "error", "content": f"处理失败: {str(fallback_error)}"}
-                        yield {"type": "done"}
-                        _cleanup_session_cancel(session_id)
-                        return
-            if not full_response:
-                yield {"type": "error", "content": "当前模型额度不足，备用模型也暂时不可用，请稍后重试"}
-                yield {"type": "done"}
-                _cleanup_session_cancel(session_id)
-                return
-        else:
-            try:
-                result = await asyncio.wait_for(
-                    agent.ainvoke({"messages": all_messages, "retry_count": 0}),
-                    timeout=60.0  # [BUG FIX] 非流式回退也加超时
-                )
-                ai_message = result["messages"][-1]
-                full_response = ai_message.content or ""
-                if full_response:
-                    for i in range(0, len(full_response), 3):
-                        yield {"type": "token", "content": full_response[i:i+3]}
-                        await asyncio.sleep(0.02)
-            except asyncio.TimeoutError:
-                yield {"type": "error", "content": "非流式回退也超时，请稍后重试"}
-                yield {"type": "done"}
-                return
-            except Exception as e2:
-                yield {"type": "error", "content": f"处理失败: {str(e2)}"}
-                yield {"type": "done"}
-                return
+        logger.error('Model request failed; no graph replay', exc_info=True)
+        yield {"type": "error", "content": f"处理失败: {str(e)}"}
+        yield {"type": "done"}
+        _cleanup_session_cancel(session_id)
+        return
 
     # 流式输出为空时回退到非流式
     if not full_response:
@@ -1258,7 +1109,7 @@ async def chat_stream_generator(user_input: str, session_id: str = "default", we
 
     elapsed = time.time() - start_time
     tool_rounds = sum(1 for m in all_messages if isinstance(m, ToolMessage))
-    logger.info(f"Agent 对话完成 | 耗时={elapsed:.2f}s | 模型={settings.LLM_MODEL} | 工具轮数={tool_rounds}")
+    logger.info(f"Agent 对话完成 | 耗时={elapsed:.2f}s | 模型={get_active_model()} | 工具轮数={tool_rounds}")
 
     yield {"type": "done"}
     _cleanup_session_cancel(session_id)  # [v6] 正常结束清理
@@ -1318,42 +1169,11 @@ async def _chat_mode_stream(user_input: str, session_id: str = "default", deep_t
         yield {"type": "error", "content": "请求超时，LLM服务响应过慢，请稍后重试"}
         return
     except Exception as e:
-        # 检测401认证错误，自动切换备用Key
-        if _check_and_switch_to_backup(e):
-            yield {"type": "error", "content": "主API Key已失效，已自动切换到备用Key，请重新提问"}
-            return
-        if _is_model_capacity_error(e):
-            fallback_response = ""
-            for fallback_model in get_model_fallbacks(settings.LLM_MODEL):
-                try:
-                    _log_model_fallback(settings.LLM_MODEL, fallback_model, e)
-                    fallback_llm = create_llm(
-                        deep_think=deep_think,
-                        model_override=fallback_model,
-                        short_response=is_simple,
-                    )
-                    yield {"type": "thinking", "content": f"当前模型额度不足，已切换到 {fallback_model} 重试..."}
-                    async for chunk in fallback_llm.astream([SystemMessage(content=chat_system_prompt)] + all_messages):
-                        content = _extract_content(chunk)
-                        if content:
-                            fallback_response += content
-                            yield {"type": "token", "content": content}
-                    if fallback_response:
-                        full_response = fallback_response
-                        break
-                except Exception as fallback_error:
-                    if not _is_model_capacity_error(fallback_error):
-                        yield {"type": "error", "content": f"处理失败: {str(fallback_error)}"}
-                        return
-            if full_response:
-                # 继续走统一的历史记录与 done 事件路径。
-                pass
-            else:
-                yield {"type": "error", "content": "当前模型额度不足，备用模型也暂时不可用，请稍后重试"}
-                return
-        else:
-            yield {"type": "error", "content": f"处理失败: {str(e)}"}
-            return
+        logger.error('Model request failed; no graph replay', exc_info=True)
+        yield {"type": "error", "content": f"处理失败: {str(e)}"}
+        yield {"type": "done"}
+        _cleanup_session_cancel(session_id)
+        return
 
     if full_response:
         try:
@@ -1368,7 +1188,7 @@ async def chat_stream_generator_multimodal(multimodal_content: list, session_id:
     """多模态流式对话：支持图片+文本的混合消息"""
     set_current_agent_id(agent_id)
     set_current_session_id(session_id)
-    current_model = settings.LLM_MODEL
+    current_model = get_active_model()
     use_model = current_model
     if current_model not in VISION_MODELS:
         use_model = DEFAULT_VISION_MODEL

@@ -24,9 +24,9 @@ AVAILABLE_MODELS = [
     # 前端只展示 4.1；在受限时间段由 resolve_effective_model() 路由到原 V4 Flash。
     {"id": "DeepSeek-V4.1-Flash", "name": "DeepSeek-V4.1-Flash", "desc": "DeepSeek V4.1 Flash（按时段自动路由）"},
     # GLM 系列（火山引擎Ark，与豆包/DeepSeek共用套餐）
-    {"id": "glm-5.2", "name": "GLM-5.2", "desc": "GLM旗舰，火山引擎Ark"},
+    {"id": "glm-5.3", "name": "GLM-5.3", "desc": "GLM旗舰，火山引擎Ark"},
     # 豆包系列（火山引擎）
-    {"id": "Doubao-Seed-2.0-pro", "name": "Doubao-Seed-2.0-Pro", "desc": "豆包旗舰，火山引擎"},
+    {"id": "doubao-seed-2.1-pro", "name": "Doubao-Seed-2.1-Pro", "desc": "豆包旗舰，火山引擎"},
     # 千问系列（阿里云）
     {"id": "qwen3.7-plus", "name": "Qwen3.7-Plus", "desc": "千问旗舰，阿里云DashScope"},
     # MiMo系列（小米）
@@ -34,13 +34,11 @@ AVAILABLE_MODELS = [
 ]
 
 # 支持图片分析的视觉模型列表
-VISION_MODELS = {"glm-4v-plus", "glm-4v", "glm-4v-flash"}
+VISION_MODELS = {"glm-5.3-flash"}
 # 默认视觉模型（当用户上传图片时自动切换）
-DEFAULT_VISION_MODEL = "glm-4v-flash"
-# 视觉模型专用 API 配置（智谱AI，无论当前选用什么模型，视觉理解始终走智谱）
-# 如未设置则回退到 LLM_API_KEY / LLM_BASE_URL
-VISION_API_KEY: str = os.getenv("VISION_API_KEY", os.getenv("LLM_API_KEY", ""))
-VISION_BASE_URL: str = os.getenv("VISION_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+DEFAULT_VISION_MODEL = "glm-5.3-flash"
+# 视觉模型走 Ark Coding 的 glm-5.3-flash；Embedding 配置不变。
+# VISION_API_KEY / VISION_BASE_URL 在下方绑定到 Coding 专用配置。
 
 # 快速模型列表（用于意图路由，加速简单问题的响应）
 MODEL_V4_FLASH = "DeepSeek-V4-Flash"
@@ -50,7 +48,7 @@ MODEL_V41_FLASH = "DeepSeek-V4.1-Flash"
 FAST_MODELS = {MODEL_V4_FLASH, MODEL_V41_FLASH}
 
 # 火山引擎模型列表（走火山引擎Ark Coding API，包括豆包/DeepSeek/GLM）
-VOLCENGINE_MODELS = {MODEL_V4_FLASH, MODEL_V41_FLASH, "Doubao-Seed-2.0-pro", "glm-5.2"}
+VOLCENGINE_MODELS = {MODEL_V4_FLASH, MODEL_V41_FLASH, "doubao-seed-2.1-pro", "glm-5.3"}
 
 # DeepSeek 模型列表（兼容旧代码引用，走火山引擎Coding API）
 DEEPSEEK_MODELS = {MODEL_V4_FLASH, MODEL_V41_FLASH}
@@ -72,6 +70,7 @@ def is_v41_restricted_time(now: datetime | None = None) -> bool:
 
 def resolve_effective_model(model_id: str, now: datetime | None = None) -> str:
     """将前端选择的模型解析为本次请求实际调用的模型。"""
+    model_id = normalize_model_id(model_id)
     if model_id == MODEL_V41_FLASH and is_v41_restricted_time(now):
         return MODEL_V4_FLASH
     return model_id
@@ -79,7 +78,7 @@ def resolve_effective_model(model_id: str, now: datetime | None = None) -> str:
 
 def get_model_fallbacks(model_id: str) -> list[str]:
     """返回额度不足时的降级顺序，不改变前端当前选择。"""
-    order = [MODEL_V4_FLASH, "glm-5.2", "Doubao-Seed-2.0-pro", "qwen3.7-plus", "mimo-v2.5-pro"]
+    order = [MODEL_V4_FLASH, "glm-5.3", "doubao-seed-2.1-pro", "qwen3.7-plus", "mimo-v2.5-pro"]
     effective = resolve_effective_model(model_id)
     return [candidate for candidate in order if candidate not in {model_id, effective}]
 
@@ -89,7 +88,7 @@ QWEN_MODELS = {"qwen3.7-plus"}
 # MiMo模型列表（走小米MiMo API）
 MIMO_MODELS = {"mimo-v2.5-pro"}
 
-# GLM模型列表（GLM-5.2 已加入 VOLCENGINE_MODELS，走火山引擎Ark；此处仅保留旧版兼容）
+# GLM模型列表（GLM-5.3 已加入 VOLCENGINE_MODELS，走火山引擎Ark；此处仅保留旧版兼容）
 GLM_MODELS = set()
 
 
@@ -106,7 +105,7 @@ class Settings:
     LLM_BASE_URL_BACKUP: str = os.getenv("LLM_BASE_URL_BACKUP", "")
 
     # DeepSeek / 豆包 独立配置（火山引擎Ark）
-    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", os.getenv("LLM_API_KEY", ""))
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
     DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
     # DeepSeek V4.1 独立配置；不设置时不复用旧 V4 Flash 密钥，避免误用额度。
     DEEPSEEK_V41_API_KEY: str = os.getenv("DEEPSEEK_V41_API_KEY", "")
@@ -161,6 +160,66 @@ class Settings:
 
 
 settings = Settings()
+DEFAULT_SELECTED_MODEL = 'DeepSeek-V4.1-Flash'
+
+# Canonical IDs keep old .env values and stored choices usable after upgrades.
+ARK_CHAT_BASE_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
+ARK_BACKUP_MODEL = "glm-5.3"
+MODEL_ID_ALIASES = {
+    "glm-5.2": "glm-5.3",
+    "Doubao-Seed-2.0-pro": "doubao-seed-2.1-pro",
+    "Doubao-Seed-2.0-Pro": "doubao-seed-2.1-pro",
+    "Doubao-Seed-2.1-Pro": "doubao-seed-2.1-pro",
+    "doubao-seed-2.0-pro": "doubao-seed-2.1-pro",
+    "glm-4v": "glm-5.3-flash",
+    "glm-4v-flash": "glm-5.3-flash",
+    "glm-4v-plus": "glm-5.3-flash",
+}
+
+
+def normalize_model_id(model_id):
+    value = model_id.strip() if isinstance(model_id, str) else model_id
+    return MODEL_ID_ALIASES.get(value, value)
+
+
+def _coding_url(url):
+    return str(url or "").rstrip("/") == ARK_CHAT_BASE_URL
+
+
+def get_model_connection(model_id, backup=False):
+    """Never pair one provider's model with another provider's credential."""
+    if backup:
+        return settings.LLM_API_KEY_BACKUP, settings.LLM_BASE_URL_BACKUP
+    model_id = normalize_model_id(model_id)
+    if model_id == "DeepSeek-V4.1-Flash":
+        return settings.DEEPSEEK_V41_API_KEY, settings.DEEPSEEK_V41_BASE_URL
+    if model_id in VOLCENGINE_MODELS or model_id in VISION_MODELS:
+        return settings.DEEPSEEK_API_KEY, settings.DEEPSEEK_BASE_URL
+    if model_id in QWEN_MODELS:
+        return settings.QWEN_API_KEY, settings.QWEN_BASE_URL
+    if model_id in globals().get("KIMI_MODELS", set()):
+        return settings.MOONSHOT_API_KEY, settings.MOONSHOT_BASE_URL
+    if model_id in globals().get("MIMO_MODELS", set()):
+        return settings.MIMO_API_KEY, settings.MIMO_BASE_URL
+    if model_id in globals().get("ARK_STANDARD_MODELS", set()):
+        return settings.ARK_API_KEY, settings.ARK_BASE_URL
+    return settings.LLM_API_KEY, settings.LLM_BASE_URL
+
+
+# Coding and standard Ark keys are distinct; ARK_API_KEY remains standard-only.
+settings.DEEPSEEK_API_KEY = (os.getenv("ARK_CODING_API_KEY") or settings.DEEPSEEK_API_KEY
+                           or (settings.LLM_API_KEY if _coding_url(settings.LLM_BASE_URL) else ""))
+settings.DEEPSEEK_BASE_URL = os.getenv("ARK_CODING_BASE_URL") or settings.DEEPSEEK_BASE_URL
+if not (_coding_url(settings.LLM_BASE_URL_BACKUP) and settings.LLM_API_KEY_BACKUP):
+    # Legacy Zhipu/Anthropic backup settings cannot serve an OpenAI Ark model.
+    settings.LLM_API_KEY_BACKUP = settings.DEEPSEEK_API_KEY
+    settings.LLM_BASE_URL_BACKUP = settings.DEEPSEEK_BASE_URL
+settings.LLM_MODEL = normalize_model_id(os.getenv("LLM_MODEL") or settings.LLM_MODEL)
+if settings.LLM_MODEL not in {m["id"] for m in AVAILABLE_MODELS}:
+    settings.LLM_MODEL = DEFAULT_SELECTED_MODEL
+VISION_API_KEY = settings.DEEPSEEK_API_KEY
+VISION_BASE_URL = settings.DEEPSEEK_BASE_URL
+
 
 
 def set_current_model(model_id: str) -> bool:

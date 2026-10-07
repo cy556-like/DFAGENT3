@@ -1,3 +1,5 @@
+from app.model_preferences import load_user_model, save_user_model, validate_model_id
+from app.request_models import use_model, stream_with_model
 """
 
 FastAPI 路由定义
@@ -350,6 +352,31 @@ def require_admin(request: Request) -> str:
 
 # ===== 请求/响应模型 =====
 
+def ensure_requested_username(username, authenticated):
+    if username != authenticated:
+        raise HTTPException(status_code=403, detail='不能访问其他账号的数据')
+
+
+def ensure_chat_ownership(username, session_id):
+    # Exact stored membership, never username-prefix matching (admin/adminquanzhi).
+    if not session_id or '/' in session_id or '\\' in session_id or session_id in {'.', '..'}:
+        raise HTTPException(status_code=400, detail='无效会话ID')
+    if not any(chat.get('chat_id') == session_id for chat in list_chats(username, skip_auto_title=True)):
+        raise HTTPException(status_code=403, detail='该会话不属于当前账号')
+
+
+def _request_model(username, model_id=None):
+    try:
+        return validate_model_id(model_id or load_user_model(username))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+def _chat_with_model(selected, *args, **kwargs):
+    with use_model(selected):
+        return chat(*args, **kwargs)
+
+
 class ChatRequest(BaseModel):
 
     """聊天请求"""
@@ -368,6 +395,7 @@ class ChatRequest(BaseModel):
 
     agent_task: str = None  # 智能体任务描述，用于动态系统提示词
     skill: str = None  # [方案B] 前端选择的技能ID（如 8d-skill），用于注入 SKILL.md + 模板
+    model_id: str | None = None
 
 
 
@@ -722,7 +750,7 @@ async def admin_reset_user_password(username: str, req: AdminResetPasswordReques
 
 @router.post("/chat", response_model=ChatResponse, summary="与 Agent 对话（非流式）")
 
-async def chat_api(req: ChatRequest, username: str = Depends(get_current_user)):
+async def chat_api(req: ChatRequest, username: str = Depends(require_auth)):
 
     """
 
@@ -737,6 +765,8 @@ async def chat_api(req: ChatRequest, username: str = Depends(get_current_user)):
     - 支持多轮对话
 
     """
+    ensure_chat_ownership(username, req.session_id)
+    selected_model = _request_model(username, req.model_id)
 
     start = time.time()
 
@@ -748,7 +778,7 @@ async def chat_api(req: ChatRequest, username: str = Depends(get_current_user)):
 
         # 必须用 asyncio.to_thread 放到线程池，否则阻塞整个事件循环导致所有请求卡死
 
-        response = await asyncio.to_thread(chat, req.message, req.session_id, web_search=req.web_search, mode=req.mode, deep_think=req.deep_think, agent_id=req.agent_id, agent_task=req.agent_task, skill=req.skill)
+        response = await asyncio.to_thread(_chat_with_model, selected_model, req.message, req.session_id, web_search=req.web_search, mode=req.mode, deep_think=req.deep_think, agent_id=req.agent_id, agent_task=req.agent_task, skill=req.skill)
 
         # 更新会话时间
 
@@ -758,7 +788,7 @@ async def chat_api(req: ChatRequest, username: str = Depends(get_current_user)):
 
             if len(parts) == 2:
 
-                update_chat_time(parts[0], req.session_id)
+                update_chat_time(username, req.session_id)
 
         except Exception:
 
@@ -766,7 +796,7 @@ async def chat_api(req: ChatRequest, username: str = Depends(get_current_user)):
 
         # 记录统计
 
-        record_message(username=username or "anonymous", model_id=get_current_model())
+        record_message(username=username or "anonymous", model_id=selected_model)
 
         return ChatResponse(response=response, session_id=req.session_id)
 
@@ -786,7 +816,7 @@ async def chat_api(req: ChatRequest, username: str = Depends(get_current_user)):
 
 @router.post("/chat/stream", summary="与 Agent 对话（流式 SSE）")
 
-async def chat_stream_api(req: ChatRequest, request: Request, username: str = Depends(get_current_user)):
+async def chat_stream_api(req: ChatRequest, request: Request, username: str = Depends(require_auth)):
 
     """
 
@@ -805,18 +835,22 @@ async def chat_stream_api(req: ChatRequest, request: Request, username: str = De
     不再只是 break 退出循环（旧方式会导致 LangGraph 后台继续调用 LLM，消耗 rate limit）
 
     """
+    ensure_chat_ownership(username, req.session_id)
+    selected_model = _request_model(username, req.model_id)
 
     start = time.time()
 
     # 记录统计
 
-    record_message(username=username or "anonymous", model_id=get_current_model())
+    record_message(username=username or "anonymous", model_id=selected_model)
 
 
 
-    generator_factory = lambda: chat_stream_generator(req.message, req.session_id, web_search=req.web_search, mode=req.mode, deep_think=req.deep_think, agent_id=req.agent_id, agent_task=req.agent_task, skill=req.skill)
+    raw_generator_factory = lambda: chat_stream_generator(req.message, req.session_id, web_search=req.web_search, mode=req.mode, deep_think=req.deep_think, agent_id=req.agent_id, agent_task=req.agent_task, skill=req.skill)
 
 
+
+    generator_factory = lambda: stream_with_model(selected_model, raw_generator_factory)
 
     return StreamingResponse(
 
@@ -866,7 +900,8 @@ async def chat_with_file_stream(
 
     store_to_kb: str = Form("true"),
 
-    username: str = Depends(get_current_user),
+    model_id: str | None = Form(None),
+    username: str = Depends(require_auth),
 
 ):
 
@@ -883,16 +918,21 @@ async def chat_with_file_stream(
     返回 Server-Sent Events (SSE) 流
 
     """
+    ensure_chat_ownership(username, session_id)
+    selected_model = _request_model(username, model_id)
 
     start = time.time()
 
     # 记录统计
 
-    record_message(username=username or "anonymous", model_id=get_current_model())
+    record_message(username=username or "anonymous", model_id=selected_model)
 
 
 
-    ext = os.path.splitext(file.filename)[1].lower()
+    filename = unquote(file.filename or '')
+    if not filename or '/' in filename or '\\' in filename or filename in {'.', '..'} or '\x00' in filename:
+        raise HTTPException(status_code=400, detail='无效文件名')
+    ext = os.path.splitext(filename)[1].lower()
 
     image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 
@@ -954,7 +994,7 @@ async def chat_with_file_stream(
 
             _sse_stream_wrapper(
 
-                lambda: chat_stream_generator_multimodal(multimodal_content, session_id, agent_id=agent_id, agent_task=agent_task, skill=skill or None),
+                lambda: stream_with_model(selected_model, lambda: chat_stream_generator_multimodal(multimodal_content, session_id, agent_id=agent_id, agent_task=agent_task, skill=skill or None)),
 
                 request, session_id, start, endpoint="/chat-with-file/stream"
 
@@ -1092,7 +1132,7 @@ async def chat_with_file_stream(
 
         _sse_stream_wrapper(
 
-            lambda: chat_stream_generator(full_message_local, session_id, web_search=web_search, mode=mode, deep_think=deep_think, agent_id=aid_local, agent_task=atask_local, skill=skill or None),
+            lambda: stream_with_model(selected_model, lambda: chat_stream_generator(full_message_local, session_id, web_search=web_search, mode=mode, deep_think=deep_think, agent_id=aid_local, agent_task=atask_local, skill=skill or None)),
 
             request, session_id, start, endpoint="/chat-with-file/stream"
 
@@ -2075,9 +2115,10 @@ async def delete_document_api(filename: str, agent_id: str = Query(None, descrip
 
 @router.get("/history/{session_id}", summary="获取对话历史")
 
-async def get_history(session_id: str):
+async def get_history(session_id: str, username: str = Depends(require_auth)):
 
     """获取指定会话的对话历史"""
+    ensure_chat_ownership(username, session_id)
 
     messages = get_history_messages(session_id)
 
@@ -2089,9 +2130,10 @@ async def get_history(session_id: str):
 
 @router.delete("/history/{session_id}", summary="清除对话历史")
 
-async def delete_history(session_id: str):
+async def delete_history(session_id: str, username: str = Depends(require_auth)):
 
     """清除指定会话的对话历史，同时清理临时文件和导出文件"""
+    ensure_chat_ownership(username, session_id)
 
     clear_session_history(session_id)
 
@@ -2147,9 +2189,11 @@ async def get_chats(
 
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
 
+    auth_username: str = Depends(require_auth),
 ):
 
     """获取用户的会话列表（支持分页，支持按模式过滤）"""
+    ensure_requested_username(username, auth_username)
 
     chats = list_chats(username, mode=mode, skip_auto_title=True)  # GET请求跳过自动标题更新，避免写副作用
 
@@ -2191,9 +2235,11 @@ async def create_chat_api(
 
     agent_id: str = Query(None, description="智能体ID，会话归属到指定智能体"),
 
+    auth_username: str = Depends(require_auth),
 ):
 
     """为用户创建一个新的会话（支持指定模式和智能体归属）"""
+    ensure_requested_username(username, auth_username)
 
     chat_info = create_chat(username, title, mode=mode, agent_id=agent_id)
 
@@ -2207,9 +2253,11 @@ async def create_chat_api(
 
 @router.delete("/chats/{chat_id}", summary="删除会话")
 
-async def delete_chat_api(chat_id: str, username: str):
+async def delete_chat_api(chat_id: str, username: str, auth_username: str = Depends(require_auth)):
 
     """删除用户的某个会话，同时清理普通模式下的临时文件和导出文件"""
+    ensure_requested_username(username, auth_username)
+    ensure_chat_ownership(auth_username, chat_id)
 
     delete_chat(username, chat_id)
 
@@ -2251,9 +2299,13 @@ async def delete_chat_api(chat_id: str, username: str):
 
 @router.put("/chats/{chat_id}/rename", summary="重命名会话")
 
-async def rename_chat_api(chat_id: str, req: RenameRequest):
+async def rename_chat_api(chat_id: str, req: RenameRequest, auth_username: str = Depends(require_auth)):
 
     """重命名用户的某个会话"""
+    ensure_requested_username(req.username, auth_username)
+    ensure_chat_ownership(auth_username, chat_id)
+    if req.chat_id != chat_id:
+        raise HTTPException(status_code=400, detail='会话ID不一致')
 
     rename_chat(req.username, req.chat_id, req.new_title)
 
@@ -2269,13 +2321,8 @@ async def rename_chat_api(chat_id: str, req: RenameRequest):
 
 @router.get("/models", summary="获取可用模型列表")
 
-async def get_models():
-
-    """获取所有可用的 LLM 模型列表"""
-
-    current = get_current_model()
-
-    return {"models": AVAILABLE_MODELS, "current": current}
+async def get_models(username: str = Depends(require_auth)):
+    return {"models": AVAILABLE_MODELS, "current": load_user_model(username)}
 
 
 
@@ -2283,17 +2330,10 @@ async def get_models():
 
 @router.post("/models/set", summary="切换模型")
 
-async def set_model(req: ModelSetRequest):
-
-    """切换当前使用的 LLM 模型"""
-
-    success = set_current_model(req.model_id)
-
-    if success:
-
-        return {"success": True, "message": f"已切换到模型: {req.model_id}"}
-
-    return {"success": False, "message": f"不支持的模型: {req.model_id}"}
+async def set_model(req: ModelSetRequest, username: str = Depends(require_auth)):
+    selected = _request_model(username, req.model_id)
+    saved = save_user_model(username, selected)
+    return {"success": True, "model_id": saved, "message": f"已选择模型: {saved}"}
 
 
 
@@ -2371,7 +2411,7 @@ async def get_skills():
 
 @router.get("/stats", summary="获取使用统计")
 
-async def get_usage_stats(username: str = Depends(get_current_user)):
+async def get_usage_stats(username: str = Depends(require_auth)):
 
     """获取系统使用统计数据"""
 
@@ -2535,7 +2575,7 @@ async def update_config(req: ConfigUpdateRequest, username: str = Depends(requir
 
 @router.get("/export/{session_id}", summary="导出对话")
 
-async def export_chat(session_id: str, format: str = "md", agent_name: str = ""):
+async def export_chat(session_id: str, format: str = "md", agent_name: str = "", username: str = Depends(require_auth)):
 
     """
 
@@ -2549,6 +2589,7 @@ async def export_chat(session_id: str, format: str = "md", agent_name: str = "")
       原生元素（Word/PDF 表格、标题、列表、代码块等），避免出现 |---|---|
       这样的纯文本残留。
     """
+    ensure_chat_ownership(username, session_id)
 
     # [BUG FIX] 使用 get_history_messages_from_file 强制从文件读取最新数据
     # 避免多worker进程下内存缓存不一致导致导出内容错误

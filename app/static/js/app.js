@@ -25,6 +25,87 @@ let webSearchEnabled = false;
 let deepThinkEnabled = false;
 let currentMode = 'agent';
 let selectedSkill = null;  // 当前选中的技能（如 '8d-skill'）
+
+// Account-scoped cache and request lifetimes. A username alone is not a lifetime:
+// old callbacks must also be rejected after signing out/back into the same account.
+let accountSessionVersion = 0;
+let authRequestVersion = 0;
+const accountRequestVersions = Object.create(null);
+let accountCacheWritesPaused = false;
+
+function captureAccountContext() {
+    return { version: accountSessionVersion, username: currentUser, token: authToken };
+}
+
+function isCurrentAccount(context) {
+    return Boolean(context.username && context.token && context.version === accountSessionVersion &&
+        context.username === currentUser && context.token === authToken);
+}
+
+function accountCacheKey(name) {
+    return currentUser ? `dfagent3:${encodeURIComponent(currentUser)}:${name}` : null;
+}
+
+function readAccountStorage(name) {
+    const key = accountCacheKey(name);
+    return key ? localStorage.getItem(key) : null;
+}
+
+function writeAccountStorage(name, value) {
+    const key = accountCacheKey(name);
+    if (key && !accountCacheWritesPaused) localStorage.setItem(key, value);
+}
+
+function beginAccountSession() {
+    const cachedAgents = readAccountStorage('agents');
+    resetAccountState(false);
+    try { myAgents = filterAgents(JSON.parse(cachedAgents || 'null')); }
+    catch (e) { myAgents = filterAgents(null); }
+    loadAgentActiveChatIds();
+}
+
+function resetAccountState(invalidateAuth = true) {
+    ++accountSessionVersion;
+    if (invalidateAuth) ++authRequestVersion;
+    if (currentAbortController) currentAbortController.abort();
+    currentAbortController = null;
+    if (typeof thinkingInterval !== 'undefined' && thinkingInterval) clearInterval(thinkingInterval);
+    if (typeof thinkingInterval !== 'undefined') thinkingInterval = null;
+    isLoading = false;
+    currentChatId = null;
+    currentAgentId = null;
+    allChats = [];
+    accountCacheWritesPaused = true;
+    try { myAgents = filterAgents(null); } finally { accountCacheWritesPaused = false; }
+    modeChatId = { agent: null, chat: null };
+    agentActiveChatId = {};
+    selectedFile = null;
+    selectedFileBase64 = null;
+    selectedSkill = null;
+    lastMessageText = '';
+    _lastSyncedAgentsHash = '';
+    _syncAgentsLock = false;
+    _syncAgentsLastTime = 0;
+    
+    const messages = document.getElementById('chatMessages');
+    if (messages) messages.innerHTML = '';
+    const input = document.getElementById('chatInput');
+    if (input) input.value = '';
+    const model = document.getElementById('modelSelect');
+    if (model) { model.innerHTML = ''; model.disabled = false; }
+    const send = document.getElementById('sendBtn');
+    const stop = document.getElementById('stopBtn');
+    if (send) { send.disabled = false; send.style.display = ''; }
+    if (stop) stop.style.display = 'none';
+    if (typeof _chatListCache !== 'undefined' && _chatListCache && typeof _chatListCache.clear === 'function') _chatListCache.clear();
+    if (typeof _chatListCache !== 'undefined' && _chatListCache && Array.isArray(_chatListCache)) _chatListCache.length = 0;
+    if (typeof _chatListLoadSeq !== 'undefined') ++_chatListLoadSeq;
+    if (typeof _chatHistoryLoadSeq !== 'undefined') ++_chatHistoryLoadSeq;
+    if (typeof chatHistoryLoadSeq !== 'undefined') ++chatHistoryLoadSeq;
+    if (typeof _chatCreateSeq !== 'undefined') ++_chatCreateSeq;
+    if (typeof _kbDocsLoadSeq !== 'undefined') ++_kbDocsLoadSeq;
+}
+
 const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
 // [#12] 同步防抖锁：避免短时间内重复调用 syncAgentsFromServer
@@ -343,7 +424,7 @@ function getAgentWelcomeConfig(agentId) {
 
 function forceCorrectAgents() {
     let existing = [];
-    try { existing = JSON.parse(localStorage.getItem('forgeAgents') || '[]'); } catch(e) { existing = []; }
+    try { existing = JSON.parse(readAccountStorage('agents') || '[]'); } catch(e) { existing = []; }
     const existingMap = {};
     existing.forEach(a => { existingMap[a.id] = a; });
 
@@ -375,7 +456,7 @@ function forceCorrectAgents() {
         };
     });
 
-    localStorage.setItem('forgeAgents', JSON.stringify(correctAgents));
+    writeAccountStorage('agents', JSON.stringify(correctAgents));
     return correctAgents;
 }
 
@@ -389,7 +470,7 @@ function filterAgents(agents) {
     return sortAgentsByFixedOrder(filtered);
 }
 
-let myAgents = filterAgents((function() { try { return JSON.parse(localStorage.getItem('forgeAgents') || 'null'); } catch(e) { return null; } })());
+let myAgents = filterAgents(null);
 let currentAgentId = null;
 let agentKbUploadMode = false;
 
@@ -406,9 +487,13 @@ function _resolveMergeDirection(local, serverAgent) {
 }
 
 async function saveAgents() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     // 过滤：只保留允许的智能体
     myAgents = filterAgents(myAgents);
-    localStorage.setItem('forgeAgents', JSON.stringify(myAgents));
+    writeAccountStorage('agents', JSON.stringify(myAgents));
     // [#12] 同步到服务器：检测数据是否真变了（chat_ids变化不算，服务端不存chat_ids）
     if (currentUser && authToken) {
         try {
@@ -426,10 +511,12 @@ async function saveAgents() {
                 headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
                 body: JSON.stringify({ agents: agentsForServer })
             });
+            if (!isCurrent()) return;
             const data = await resp.json();
+            if (!isCurrent()) return;
             if (data.success && data.agents && data.agents.length > 0) {
                 // Merge: preserve local chat_ids, use timestamp-based comparison for name/task/updated_at
-                const localAgents = JSON.parse(localStorage.getItem('forgeAgents') || '[]');
+                const localAgents = JSON.parse(readAccountStorage('agents') || '[]');
                 const localMap = {};
                 localAgents.forEach(a => { localMap[a.id] = a; });
                 const mergedAgents = data.agents.map(serverAgent => {
@@ -446,36 +533,43 @@ async function saveAgents() {
                     };
                 });
                 myAgents = filterAgents(mergedAgents);
-                localStorage.setItem('forgeAgents', JSON.stringify(myAgents));
+                writeAccountStorage('agents', JSON.stringify(myAgents));
             }
-        } catch (e) {
+        } catch (e) { if (!isCurrent()) return;
             console.warn('[智能体同步失败]', e);
         }
     }
 }
 
 async function syncAgentsFromServer(force = false) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+
     // [#12] 防抖锁：5秒内不重复同步（除非 force=true）
     if (!force && _syncAgentsLock) return;
     const now = Date.now();
     if (!force && (now - _syncAgentsLastTime) < _SYNC_AGENTS_COOLDOWN) return;
+    const requestVersion = accountRequestVersions['syncAgentsFromServer'] = (accountRequestVersions['syncAgentsFromServer'] || 0) + 1;
+    const isCurrent = () => isCurrentAccount(account) && accountRequestVersions['syncAgentsFromServer'] === requestVersion;
     _syncAgentsLock = true;
     _syncAgentsLastTime = now;
 
     // 从服务器拉取最新智能体数据并合并（保留本地 chat_ids）
     // 修复跨浏览器同步：先GET服务器数据，再与本地比较，只有本地更新时才POST
-    if (!currentUser || !authToken) { _syncAgentsLock = false; return; }
+    if (!currentUser || !authToken) { if (isCurrent()) _syncAgentsLock = false; return; }
     try {
         // Step 1: GET 服务器最新数据（不发送本地数据，避免旧数据覆盖服务器）
         const getResp = await fetch('/api/v1/agents', {
             method: 'GET',
             headers: { 'Authorization': 'Bearer ' + authToken }
         });
+        if (!isCurrent()) return;
         const getData = await getResp.json();
+        if (!isCurrent()) return;
         
         if (getData.success && getData.agents && getData.agents.length > 0) {
             const serverAgents = getData.agents;
-            const localAgents = JSON.parse(localStorage.getItem('forgeAgents') || '[]');
+            const localAgents = JSON.parse(readAccountStorage('agents') || '[]');
             const localMap = {};
             localAgents.forEach(a => { localMap[a.id] = a; });
             
@@ -497,7 +591,7 @@ async function syncAgentsFromServer(force = false) {
             });
             
             myAgents = filterAgents(mergedAgents);
-            localStorage.setItem('forgeAgents', JSON.stringify(myAgents));
+            writeAccountStorage('agents', JSON.stringify(myAgents));
             
             // Step 3: 只有本地有更新数据时才POST到服务器
             if (localHasNewer) {
@@ -515,7 +609,8 @@ async function syncAgentsFromServer(force = false) {
                             headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
                             body: JSON.stringify({ agents: agentsForServer })
                         });
-                    } catch (postErr) {
+                        if (!isCurrent()) return;
+                    } catch (postErr) { if (!isCurrent()) return;
                         console.warn('[智能体POST同步失败]', postErr);
                     }
                 } else {
@@ -526,20 +621,27 @@ async function syncAgentsFromServer(force = false) {
 
         // Rebuild chat_ids from server data
         await rebuildChatIdsFromServer();
+        if (!isCurrent()) return;
         renderMyAgents();
-    } catch (e) {
+    } catch (e) { if (!isCurrent()) return;
         console.warn('[智能体同步失败]', e);
     } finally {
-        _syncAgentsLock = false;
+        if (isCurrent()) _syncAgentsLock = false;
     }
 }
 // BUG FIX: Rebuild agent.chat_ids from server chat data to restore agent-chat associations
 // after refresh/cross-browser where local chat_ids are lost
 async function rebuildChatIdsFromServer() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     if (!currentUser || !authToken) return;
     try {
         const resp = await fetch(`/api/v1/chats?username=${encodeURIComponent(currentUser)}`, { headers: apiHeaders() });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         console.log('[rebuildChatIds] server chats:', data);
         if (data.success && data.chats) {
             const serverChats = data.chats;
@@ -550,14 +652,15 @@ async function rebuildChatIdsFromServer() {
                     .map(chat => chat.chat_id);
                 console.log(`[rebuildChatIds] Agent ${agent.name} (${agent.id}): found ${matchingChatIds.length} chats`);
                 // Merge: add any new server chat_ids
-                const existingIds = new Set(agent.chat_ids || []);
+                const owned = new Map(serverChats.map(chat => [chat.chat_id, chat]));
+                const existingIds = new Set((agent.chat_ids || []).filter(id => owned.has(id) && !owned.get(id).agent_id));
                 matchingChatIds.forEach(id => existingIds.add(id));
                 agent.chat_ids = Array.from(existingIds);
             });
-            localStorage.setItem('forgeAgents', JSON.stringify(myAgents));
+            writeAccountStorage('agents', JSON.stringify(myAgents));
             console.log('[rebuildChatIds] Rebuilt chat_ids from server');
         }
-    } catch (e) {
+    } catch (e) { if (!isCurrent()) return;
         console.warn('[rebuildChatIds失败]', e);
     }
 }
@@ -636,6 +739,10 @@ function deleteAgent(agentId) {
 }
 
 async function switchToAgent(agentId) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     const agent = myAgents.find(a => a.id === agentId);
     if (!agent) return;
 
@@ -726,6 +833,10 @@ function renderMyAgents() {
 let editingAgentId = null;
 
 async function createNewChatForAgent(agentId) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     console.log('[新建对话] 开始, agentId=', agentId, 'currentUser=', currentUser, 'currentMode=', currentMode);
     if (!currentUser) {
         console.warn('[新建对话] 未登录，跳过');
@@ -753,7 +864,9 @@ async function createNewChatForAgent(agentId) {
             method: 'POST',
             headers: apiHeaders()
         });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         console.log('[新建对话] API返回:', JSON.stringify(data));
 
         if (data.success && data.chat) {
@@ -771,6 +884,7 @@ async function createNewChatForAgent(agentId) {
 
             // 刷新聊天列表
             await loadChatList();
+            if (!isCurrent()) return;
 
             // 清空聊天区域，显示新对话界面
             clearChatUI();
@@ -809,7 +923,7 @@ async function createNewChatForAgent(agentId) {
             console.error('[新建对话] API返回失败:', data);
             showToast('创建对话失败');
         }
-    } catch (e) {
+    } catch (e) { if (!isCurrent()) return;
         console.error('[新建对话] 异常:', e);
         showToast('创建对话异常: ' + e.message);
     }
@@ -875,18 +989,18 @@ let agentActiveChatId = {};
 ALLOWED_AGENT_IDS.forEach(id => { agentActiveChatId[id] = null; });
 
 function saveAgentActiveChatIds() {
-    localStorage.setItem('agentActiveChatIds', JSON.stringify(agentActiveChatId));
+    writeAccountStorage('agentActiveChatIds', JSON.stringify(agentActiveChatId));
 }
 
 function loadAgentActiveChatIds() {
     try {
-        const saved = localStorage.getItem('agentActiveChatIds');
+        const saved = readAccountStorage('agentActiveChatIds');
         if (saved) agentActiveChatId = JSON.parse(saved);
     } catch(e) {}
 }
 
 // Load per-agent active chat IDs at startup
-loadAgentActiveChatIds();
+
 
 // ===== API Helper (with JWT Token) =====
 function apiHeaders() {
@@ -998,22 +1112,29 @@ function switchMode(mode) {
 
 // 恢复当前模式上次的活跃会话，如果没有则新建
 async function restoreModeChat() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     const modeChats = getModeChats();
     const savedId = modeChatId[currentMode];
     if (modeChats.length === 0) {
         // 该模式没有会话，新建一个
         await createNewChat();
+        if (!isCurrent()) return;
     } else if (savedId && modeChats.some(c => c.chat_id === savedId)) {
         // 恢复上次该模式的会话
         currentChatId = savedId;
         renderChatList();
         await loadChatHistory(savedId);
+        if (!isCurrent()) return;
     } else {
         // 选择该模式的第一个会话
         currentChatId = modeChats[0].chat_id;
         modeChatId[currentMode] = currentChatId;
         renderChatList();
         await loadChatHistory(currentChatId);
+        if (!isCurrent()) return;
     }
 }
 
@@ -1188,9 +1309,16 @@ function copyCodeBlock(codeId, btn) {
 
 // ===== Model Management =====
 async function loadModels() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const requestVersion = accountRequestVersions['model'] = (accountRequestVersions['model'] || 0) + 1;
+    const isCurrent = () => isCurrentAccount(account) && accountRequestVersions['model'] === requestVersion;
+
     try {
-        const resp = await fetch('/api/v1/models');
+        const resp = await fetch('/api/v1/models', { headers: apiHeaders() });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         const select = document.getElementById('modelSelect');
         select.innerHTML = '';
         data.models.forEach(m => {
@@ -1199,20 +1327,27 @@ async function loadModels() {
             if (m.id === data.current) opt.selected = true;
             select.appendChild(opt);
         });
-    } catch (e) { console.error('加载模型列表失败', e); }
+    } catch (e) { if (!isCurrent()) return; console.error('加载模型列表失败', e); }
 }
 
 async function switchModel() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const requestVersion = accountRequestVersions['model'] = (accountRequestVersions['model'] || 0) + 1;
+    const isCurrent = () => isCurrentAccount(account) && accountRequestVersions['model'] === requestVersion;
+
     const modelId = document.getElementById('modelSelect').value;
     try {
         const resp = await fetch('/api/v1/models/set', { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ model_id: modelId }) });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         if (data.success) {
             const select = document.getElementById('modelSelect');
             const name = select.options[select.selectedIndex].textContent;
             addMessageToUI('assistant', `✅ 已切换到模型: ${name}`);
         }
-    } catch (e) { console.error('切换模型失败', e); }
+    } catch (e) { if (!isCurrent()) return; console.error('切换模型失败', e); }
 }
 
 // ===== Auth =====
@@ -1266,20 +1401,26 @@ document.addEventListener('keydown', function(e) {
 });
 
 async function doLogin() {
+    const authVersion = ++authRequestVersion;
+    const isCurrent = () => authVersion === authRequestVersion;
     const username = document.getElementById('loginUser').value.trim();
     const password = document.getElementById('loginPass').value.trim();
     const msgEl = document.getElementById('loginMsg');
     if (!username || !password) { msgEl.className = 'msg-box error'; msgEl.textContent = '请输入用户名和密码'; return; }
     try {
         const resp = await fetch('/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         if (data.success) {
             currentUser = username;
+            beginAccountSession();
             userRole = data.role || 'user';
             if (data.token) { authToken = data.token; localStorage.setItem('authToken', data.token); }
             localStorage.setItem('userRole', userRole);
             msgEl.className = 'msg-box success'; msgEl.textContent = '登录成功！';
             setTimeout(async () => {
+                if (!isCurrent()) return;
                 document.getElementById('loginModal').classList.remove('show');
                 document.getElementById('chatPage').style.display = 'flex';
                 document.body.classList.add('body-chat-mode');
@@ -1293,17 +1434,19 @@ async function doLogin() {
                 }
                 loadChatList();
                 loadModels();
-                await syncAgentsFromServer(true);  // [#12] 登录时强制同步一次，内部已调用 rebuildChatIdsFromServer（会GET /chats）
+                await syncAgentsFromServer(true);
+                if (!isCurrent()) return;  // [#12] 登录时强制同步一次，内部已调用 rebuildChatIdsFromServer（会GET /chats）
                 renderMyAgents();
                 updateKbUploadVisibility();
                 updateHeaderKbVisibility();
                 // [#14] 默认选中第一个智能体，避免进入空白的agent模式
                 if (!currentAgentId && myAgents.length > 0) {
                     await switchToAgent(myAgents[0].id);
+                    if (!isCurrent()) return;
                 }
             }, 500);
         } else { msgEl.className = 'msg-box error'; msgEl.textContent = data.message || '登录失败'; }
-    } catch (e) { msgEl.className = 'msg-box error'; msgEl.textContent = '网络错误'; }
+    } catch (e) { if (!isCurrent()) return; msgEl.className = 'msg-box error'; msgEl.textContent = '网络错误'; }
 }
 
 async function doRegister() {
@@ -1312,6 +1455,7 @@ async function doRegister() {
 }
 
 function doLogout() {
+    resetAccountState();
     currentUser = null; userRole = null; authToken = null; selectedFile = null; currentChatId = null; allChats = []; currentAgentId = null; agentKbUploadMode = false;
     localStorage.removeItem('authToken');
     localStorage.removeItem('userRole');
@@ -1383,7 +1527,8 @@ window.addEventListener('popstate', function(e) {
         // Back to login - perform logout to ensure clean state
         if (currentUser) {
             // Clear session but don't push another history entry
-            currentUser = null; userRole = null; authToken = null; selectedFile = null; currentChatId = null; allChats = []; currentAgentId = null; agentKbUploadMode = false;
+            resetAccountState();
+    currentUser = null; userRole = null; authToken = null; selectedFile = null; currentChatId = null; allChats = []; currentAgentId = null; agentKbUploadMode = false;
             localStorage.removeItem('authToken');
             localStorage.removeItem('userRole');
             if (kbPage) kbPage.style.display = 'none';
@@ -1403,13 +1548,18 @@ window.addEventListener('popstate', function(e) {
 
 // ===== Auto-login with JWT token =====
 async function tryAutoLogin() {
+    const authVersion = ++authRequestVersion;
+    const isCurrent = () => authVersion === authRequestVersion;
     const token = localStorage.getItem('authToken');
     if (!token) return false;
     try {
         const resp = await fetch('/api/v1/auth/me', { headers: { 'Authorization': 'Bearer ' + token } });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         if (data.valid && data.username) {
             currentUser = data.username;
+            beginAccountSession();
             authToken = token;
             // 自动登录成功：隐藏登录页，显示聊天页
             document.getElementById('loginModal').classList.remove('show');
@@ -1421,17 +1571,19 @@ async function tryAutoLogin() {
             document.getElementById('headerUserAvatar').textContent = data.username[0].toUpperCase();
             loadChatList();
             loadModels();
-            await syncAgentsFromServer(true);  // [#12] 自动登录时强制同步
+            await syncAgentsFromServer(true);
+            if (!isCurrent()) return;  // [#12] 自动登录时强制同步
             renderMyAgents();
             updateKbUploadVisibility();
             updateHeaderKbVisibility();
             // [#14] 默认选中第一个智能体，避免进入空白的agent模式
             if (!currentAgentId && myAgents.length > 0) {
                 await switchToAgent(myAgents[0].id);
+                if (!isCurrent()) return;
             }
             return true;
         }
-    } catch (e) { console.warn('自动登录失败', e); }
+    } catch (e) { if (!isCurrent()) return; console.warn('自动登录失败', e); }
     localStorage.removeItem('authToken');
     // 自动登录失败：确保登录页可见
     document.getElementById('loginModal').classList.add('show');
@@ -1601,10 +1753,17 @@ function fillQuick(el) {
 
 // ===== Chat List =====
 async function loadChatList() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const requestVersion = accountRequestVersions['loadChatList'] = (accountRequestVersions['loadChatList'] || 0) + 1;
+    const isCurrent = () => isCurrentAccount(account) && accountRequestVersions['loadChatList'] === requestVersion;
+
     if (!currentUser) return;
     try {
         const resp = await fetch(`/api/v1/chats?username=${encodeURIComponent(currentUser)}`, { headers: apiHeaders() });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         if (data.success) {
             allChats = data.chats;
             renderChatList();
@@ -1615,14 +1774,16 @@ async function loadChatList() {
             const currentChatStillExists = currentChatId && allChats.some(c => c.chat_id === currentChatId);
             if (modeChats.length === 0 && !currentChatStillExists) {
                 await createNewChat();
+                if (!isCurrent()) return;
             } else if (!currentChatId || (!currentChatStillExists && !modeChats.some(c => c.chat_id === currentChatId))) {
                 currentChatId = modeChats[0].chat_id;
                 modeChatId[currentMode] = currentChatId;
                 renderChatList();
                 await loadChatHistory(currentChatId);
+                if (!isCurrent()) return;
             }
         }
-    } catch (e) { console.error('加载会话列表失败', e); }
+    } catch (e) { if (!isCurrent()) return; console.error('加载会话列表失败', e); }
 }
 
 function renderChatList() {
@@ -1668,11 +1829,17 @@ function renderChatList() {
 }
 
 async function createNewChat() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     if (!currentUser) return;
     try {
         const chatTitle = currentAgentId ? (myAgents.find(a => a.id === currentAgentId)?.name || '新对话') : '新对话';
         const resp = await fetch(`/api/v1/chats?username=${encodeURIComponent(currentUser)}&title=${encodeURIComponent(chatTitle)}&mode=${currentMode}&agent_id=${currentAgentId || ''}`, { method: 'POST', headers: apiHeaders() });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         if (data.success) {
             currentChatId = data.chat.chat_id;
             modeChatId[currentMode] = currentChatId;
@@ -1688,13 +1855,18 @@ async function createNewChat() {
                 }
             }
             await loadChatList();
+            if (!isCurrent()) return;
             clearChatUI();
             closeSidebarOnMobile();
         }
-    } catch (e) { console.error('创建会话失败', e); }
+    } catch (e) { if (!isCurrent()) return; console.error('创建会话失败', e); }
 }
 
 async function switchChat(chatId) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     if (chatId === currentChatId) return;
     // [BUG FIX #2] 切换聊天时中断正在进行的流式响应
     // 防止旧SSE流在后台继续运行导致 isLoading 锁死、新聊天无法发送消息
@@ -1719,14 +1891,23 @@ async function switchChat(chatId) {
     renderChatList();
     updateHeaderKbVisibility();
     await loadChatHistory(chatId);
+    if (!isCurrent()) return;
 }
 
 async function loadChatHistory(chatId) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const requestVersion = accountRequestVersions['loadChatHistory'] = (accountRequestVersions['loadChatHistory'] || 0) + 1;
+    const originChatId = currentChatId;
+    const isCurrent = () => isCurrentAccount(account) && accountRequestVersions['loadChatHistory'] === requestVersion && currentChatId === originChatId;
+
     const container = document.getElementById('chatMessages');
     container.innerHTML = '';
     try {
         const resp = await fetch(`/api/v1/history/${chatId}`, { headers: apiHeaders() });
+        if (!isCurrent()) return;
         const data = await resp.json();
+        if (!isCurrent()) return;
         const messages = data.messages || [];
         if (messages.length > 0) {
             // [性能修复] 限制加载的消息数量，避免DOM过多导致页面卡顿
@@ -1747,13 +1928,18 @@ async function loadChatHistory(chatId) {
             scrollToBottom();
         }
         updateCenteredMode();
-    } catch (e) { console.error('加载历史失败', e); }
+    } catch (e) { if (!isCurrent()) return; console.error('加载历史失败', e); }
 }
 
 async function deleteChatItem(chatId) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     if (!confirm('确定删除这个对话？')) return;
     try {
         await fetch(`/api/v1/chats/${chatId}?username=${encodeURIComponent(currentUser)}`, { method: 'DELETE', headers: apiHeaders() });
+        if (!isCurrent()) return;
 
         // Remove chat_id from all agents
         myAgents.forEach(agent => {
@@ -1774,12 +1960,14 @@ async function deleteChatItem(chatId) {
             clearChatUI();
         }
         await loadChatList();
+        if (!isCurrent()) return;
         // 如果当前模式没有会话了，新建一个
         const modeChats = getModeChats();
         if (modeChats.length === 0) {
             await createNewChat();
+            if (!isCurrent()) return;
         }
-    } catch (e) { console.error('删除会话失败', e); }
+    } catch (e) { if (!isCurrent()) return; console.error('删除会话失败', e); }
 }
 
 function openRename(chatId, currentTitle) {
@@ -1795,6 +1983,10 @@ function closeRename() {
 }
 
 async function confirmRename() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     const newTitle = document.getElementById('renameInput').value.trim();
     if (!newTitle || !renamingChatId) return;
     const username = currentUser || '';
@@ -1804,9 +1996,11 @@ async function confirmRename() {
             headers: apiHeaders(),
             body: JSON.stringify({ username, chat_id: renamingChatId, new_title: newTitle })
         });
+        if (!isCurrent()) return;
         document.getElementById('renameOverlay').classList.remove('show');
         await loadChatList();
-    } catch (e) { showToast('重命名失败'); }
+        if (!isCurrent()) return;
+    } catch (e) { if (!isCurrent()) return; showToast('重命名失败'); }
     renamingChatId = null;
 }
 
@@ -1821,12 +2015,17 @@ function clearChatUI() {
 }
 
 async function clearCurrentChat() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     if (!currentChatId) return;
     if (!confirm('确定清除当前对话的所有消息？')) return;
     try {
         await fetch(`/api/v1/history/${currentChatId}`, { method: 'DELETE', headers: apiHeaders() });
+        if (!isCurrent()) return;
         clearChatUI();
-    } catch (e) {}
+    } catch (e) { if (!isCurrent()) return;}
 }
 
 // ===== Sidebar =====
@@ -1988,6 +2187,11 @@ function cleanupFrontendMemory() {
 setInterval(cleanupFrontendMemory, 5 * 60 * 1000);
 
 async function streamChat(url, options, bubble) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const originChatId = currentChatId;
+    const isCurrent = () => isCurrentAccount(account) && currentChatId === originChatId;
+
     let fullText = '';
     let cursorEl = null;
     let thinkingEl = null;
@@ -2011,6 +2215,7 @@ async function streamChat(url, options, bubble) {
         smartScrollToBottom();
         // Rotate thinking text
         thinkingInterval = setInterval(() => {
+            if (!isCurrent()) return;
             thinkingTextIndex = (thinkingTextIndex + 1) % THINKING_TEXTS.length;
             const statusEl = thinkingEl?.querySelector('.think-status');
             if (statusEl) statusEl.textContent = THINKING_TEXTS[thinkingTextIndex];
@@ -2075,6 +2280,7 @@ async function streamChat(url, options, bubble) {
     function renderStreamMarkdown() {
         if (streamRenderTimer) return;
         streamRenderTimer = setTimeout(() => {
+            if (!isCurrent()) return;
             streamRenderTimer = null;
             doStreamRender();
         }, STREAM_RENDER_INTERVAL);
@@ -2091,7 +2297,7 @@ async function streamChat(url, options, bubble) {
                 } else {
                     bubble.innerHTML = escapeHtml(fullText).replace(/\n/g, '<br>');
                 }
-            } catch (e) {
+            } catch (e) { if (!isCurrent()) return;
                 bubble.innerHTML = escapeHtml(fullText).replace(/\n/g, '<br>');
             }
         }
@@ -2131,10 +2337,12 @@ async function streamChat(url, options, bubble) {
 
     try {
         const resp = await fetch(url, options);
+        if (!isCurrent()) return;
 
         if (!resp.ok) {
             removeThinking();
             const errData = await resp.json().catch(() => ({}));
+            if (!isCurrent()) return;
             if (resp.status === 401) {
                 showToast('登录已过期，请重新登录');
                 doLogout();
@@ -2150,6 +2358,7 @@ async function streamChat(url, options, bubble) {
 
         while (true) {
             const { done, value } = await reader.read();
+            if (!isCurrent()) return;
             if (done) break;
 
             buffer += decoder.decode(value, { stream: true });
@@ -2171,7 +2380,7 @@ async function streamChat(url, options, bubble) {
                         case 'done': finalize(); break;
                         case 'error': removeThinking(); finalize(); { const errSpan = document.createElement('span'); errSpan.style.color = 'var(--error)'; errSpan.textContent = data.content; bubble.appendChild(document.createElement('br')); bubble.appendChild(errSpan); } break;
                     }
-                } catch (e) { console.warn('SSE parse error:', e, jsonStr); }
+                } catch (e) { if (!isCurrent()) return; console.warn('SSE parse error:', e, jsonStr); }
             }
         }
 
@@ -2195,7 +2404,7 @@ async function streamChat(url, options, bubble) {
             }
         }
 
-    } catch (e) {
+    } catch (e) { if (!isCurrent()) return;
         removeThinking();
         finalize();
         if (e.name === 'AbortError') {
@@ -2213,7 +2422,7 @@ async function streamChat(url, options, bubble) {
             bubble.innerHTML = `<span style="color:var(--error)">网络错误，请重试</span>`;
         }
     } finally {
-        resetStreamingUI();
+        if (isCurrent()) resetStreamingUI();
     }
 }
 
@@ -2358,6 +2567,11 @@ async function downloadExportFile(url) {
 
 // ===== Send Message =====
 async function sendMessage() {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const originChatId = currentChatId;
+    const isCurrent = () => isCurrentAccount(account);
+
     if (isLoading) return;
     // [BUG FIX #1] 竞态条件修复：在 createNewChat() 之前就设置 isLoading
     // 防止快速双击/连按回车时，第二次调用在 await createNewChat() 期间
@@ -2366,6 +2580,7 @@ async function sendMessage() {
     if (!currentChatId) {
         // 没有当前对话时自动创建新对话（点击智能体后直接发消息的场景）
         await createNewChat();
+        if (!isCurrent()) return;
         if (!currentChatId) { isLoading = false; return; }  // 创建失败才退出，同时释放锁
     }
     const input = document.getElementById('msgInput');
@@ -2391,6 +2606,7 @@ async function sendMessage() {
         formData.append('file', selectedFile);
         formData.append('message', message);
         formData.append('session_id', currentChatId);
+            formData.append('model_id', document.getElementById('modelSelect').value);
         formData.append('web_search', webSearchEnabled);
         formData.append('mode', currentMode);
         formData.append('deep_think', deepThinkEnabled);
@@ -2406,8 +2622,10 @@ async function sendMessage() {
         // 聊天框上传文件仅用于临时分析，不存入知识库
         formData.append('store_to_kb', 'false');
         await streamChat('/api/v1/chat-with-file/stream', { method: 'POST', body: formData, headers: authToken ? { 'Authorization': 'Bearer ' + authToken } : {} }, bubble);
+        if (!isCurrent()) return;
         removeFile();
         await loadChatList();
+        if (!isCurrent()) return;
     } else if (selectedFile && !message) {
         // 文件无消息时，自动添加分析提示，走聊天流式分析（不存知识库）
         addMessageToUI('user', `[上传文档] ${selectedFile.name}`);
@@ -2416,6 +2634,7 @@ async function sendMessage() {
         formData.append('file', selectedFile);
         formData.append('message', '请分析这个文件的内容');
         formData.append('session_id', currentChatId);
+            formData.append('model_id', document.getElementById('modelSelect').value);
         formData.append('web_search', webSearchEnabled);
         formData.append('mode', currentMode);
 formData.append('skill', selectedSkill || '');
@@ -2427,8 +2646,10 @@ formData.append('skill', selectedSkill || '');
         }
         formData.append('store_to_kb', 'false');
         await streamChat('/api/v1/chat-with-file/stream', { method: 'POST', body: formData, headers: authToken ? { 'Authorization': 'Bearer ' + authToken } : {} }, bubble);
+        if (!isCurrent()) return;
         removeFile();
         await loadChatList();
+        if (!isCurrent()) return;
     } else {
         lastMessageText = message;
         addMessageToUI('user', message);
@@ -2437,13 +2658,16 @@ formData.append('skill', selectedSkill || '');
         await streamChat('/api/v1/chat/stream', {
             method: 'POST',
             headers: apiHeaders(),
-            body: JSON.stringify({ message, session_id: currentChatId, web_search: webSearchEnabled, mode: currentMode, deep_think: deepThinkEnabled, skill: selectedSkill || '', agent_id: currentAgentId || '', agent_task: (currentAgentId && myAgents.find(a => a.id === currentAgentId)) ? myAgents.find(a => a.id === currentAgentId).task : '' })
+            body: JSON.stringify({ message, session_id: currentChatId,
+                model_id: document.getElementById('modelSelect').value, web_search: webSearchEnabled, mode: currentMode, deep_think: deepThinkEnabled, skill: selectedSkill || '', agent_id: currentAgentId || '', agent_task: (currentAgentId && myAgents.find(a => a.id === currentAgentId)) ? myAgents.find(a => a.id === currentAgentId).task : '' })
         }, bubble);
+        if (!isCurrent()) return;
         await loadChatList();
+        if (!isCurrent()) return;
     }
     scrollToBottom();
     } finally {
-        resetStreamingUI();
+        if (isCurrent()) resetStreamingUI();
     }
 }
 
@@ -2514,6 +2738,11 @@ function copyMessage(btn) {
 }
 
 async function regenerateMessage(btn) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const originChatId = currentChatId;
+    const isCurrent = () => isCurrentAccount(account) && currentChatId === originChatId;
+
     if (isLoading) return;
     const messageDiv = btn.closest('.message');
     const prev = messageDiv.previousElementSibling;
@@ -2531,11 +2760,13 @@ async function regenerateMessage(btn) {
     await streamChat('/api/v1/chat/stream', {
         method: 'POST',
         headers: apiHeaders(),
-        body: JSON.stringify({ message: userText, session_id: currentChatId, web_search: webSearchEnabled, mode: currentMode, deep_think: deepThinkEnabled,
+        body: JSON.stringify({ message: userText, session_id: currentChatId,
+                model_id: document.getElementById('modelSelect').value, web_search: webSearchEnabled, mode: currentMode, deep_think: deepThinkEnabled,
         skill: selectedSkill || '', agent_id: currentAgentId || '', agent_task: (currentAgentId && myAgents.find(a => a.id === currentAgentId)) ? myAgents.find(a => a.id === currentAgentId).task : '' })
     }, bubble);
+    if (!isCurrent()) return;
     } finally {
-        resetStreamingUI();
+        if (isCurrent()) resetStreamingUI();
     }
 }
 
@@ -2559,8 +2790,9 @@ function setFilePreview(file) {
     document.getElementById('fileBar').style.display = 'flex';
     document.getElementById('msgInput').placeholder = '针对此文件输入问题，或修改要求...';
     if (isImage) {
+        const fileAccount = captureAccountContext();
         const reader = new FileReader();
-        reader.onload = function(e) { selectedFileBase64 = e.target.result; };
+        reader.onload = function(e) { if (isCurrentAccount(fileAccount) && selectedFile === file) selectedFileBase64 = e.target.result; };
         reader.readAsDataURL(file);
     }
 }
@@ -2791,6 +3023,10 @@ function showDevSkillToast(skillName) {
 }
 
 async function exportChat(format) {
+    const account = captureAccountContext();
+    if (!isCurrentAccount(account)) return;
+    const isCurrent = () => isCurrentAccount(account);
+
     if (!currentChatId) return;
     const dropdown = document.getElementById('exportDropdown');
     if (dropdown) dropdown.classList.remove('show');
@@ -2806,9 +3042,11 @@ async function exportChat(format) {
         const params = new URLSearchParams({ format });
         if (agentName) params.set('agent_name', agentName);
         const resp = await fetch(`/api/v1/export/${currentChatId}?${params.toString()}`, { headers: apiHeaders() });
+        if (!isCurrent()) return;
         if (!resp.ok) { showToast('导出失败'); return; }
 
         const blob = await resp.blob();
+        if (!isCurrent()) return;
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -2821,7 +3059,7 @@ async function exportChat(format) {
         a.click();
         URL.revokeObjectURL(url);
         showToast(`已导出为 ${nameMap[format] || format.toUpperCase()}`);
-    } catch (e) {
+    } catch (e) { if (!isCurrent()) return;
         showToast('导出失败');
     }
 }
@@ -2960,8 +3198,9 @@ function handleDroppedFile(file) {
     document.getElementById('fileName').textContent = file.name;
     document.getElementById('fileBar').style.display = 'flex';
     if (file.type.startsWith('image/')) {
+        const fileAccount = captureAccountContext();
         const reader = new FileReader();
-        reader.onload = (e) => { selectedFileBase64 = e.target.result; };
+        reader.onload = (e) => { if (isCurrentAccount(fileAccount) && selectedFile === file) selectedFileBase64 = e.target.result; };
         reader.readAsDataURL(file);
     } else { selectedFileBase64 = null; }
     showToast('文件已添加：' + file.name);
