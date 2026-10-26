@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
     <title>东风科技研发智能体平台</title>
     <link rel="icon" type="image/png" sizes="32x32" href="/static/icons/icon-96.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
@@ -20,6 +20,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/style.css?v=20260614k">
+    <link rel="stylesheet" href="/static/css/responsive.css?v=20261026-mobile1">
 </head>
 <body>
 <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeSidebarMobile()"></div>
@@ -83,7 +84,8 @@
     </aside>
     <div class="chat-main">
         <header class="chat-header">
-            <div class="header-title-group">
+            <div class="header-title-group">
+                <button class="mobile-sidebar-toggle" id="mobileSidebarToggle" type="button" onclick="toggleSidebar()" aria-label="打开智能体和历史对话" aria-controls="sidebar" aria-expanded="false">☰</button>
                 <h1 id="chatTitle">东风科技研发智能体平台</h1>
                 <button class="header-kb-btn" id="headerKbBtn" onclick="showKbPage()" title="知识库" aria-label="知识库" style="display:none;"><span class="kb-btn-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg></span><span class="kb-btn-text">知识库</span></button>
                 <div class="skills-wrapper" id="skillsWrapper" style="display:none;"><button class="header-kb-btn" id="headerSkillsBtn" onclick="toggleSkillsDropdown(event)" title="技能" aria-label="技能" aria-haspopup="true"><span class="kb-btn-icon">🛠️</span><span class="kb-btn-text">Skills</span></button><div class="skills-dropdown" id="skillsDropdown" role="menu"><button onclick="selectSkill('8d-skill')" role="menuitem">📋 8D工作法（示例）</button><button onclick="showDevSkillToast('BOM比对与生成')" role="menuitem" >📊 BOM比对与生成</button><button onclick="showDevSkillToast('物料信息批量查询')" role="menuitem" >🔍 物料信息批量查询</button><button onclick="showDevSkillToast('技术要求生成与校验')" role="menuitem" >📝 技术要求生成与校验</button><button onclick="showDevSkillToast('HUD显示效果评估')" role="menuitem" >🖥️ HUD显示效果评估</button><button onclick="showDevSkillToast('制动踏板力曲线绘制')" role="menuitem" >📉 制动踏板力曲线绘制</button><button onclick="showDevSkillToast('悬架弹簧刚度计算')" role="menuitem" >🔧 悬架弹簧刚度计算</button><button onclick="showDevSkillToast('电机性能曲线绘制')" role="menuitem" >📈 电机性能曲线绘制</button><button onclick="showDevSkillToast('电机效率MAP生成')" role="menuitem" >🗺️ 电机效率MAP生成</button><button onclick="showDevSkillToast('电机NVH频谱分析')" role="menuitem" >🔊 电机NVH频谱分析</button><button onclick="showDevSkillToast('电驱动系统能量流分析')" role="menuitem" >⚡ 电驱动系统能量流分析</button><button onclick="showDevSkillToast('空调系统风量分布计算')" role="menuitem" >❄️ 空调系统风量分布计算</button><button onclick="showDevSkillToast('座舱温度场分析')" role="menuitem" >🌡️ 座舱温度场分析</button><button onclick="showDevSkillToast('焊接接头强度计算')" role="menuitem" >🛠️ 焊接接头强度计算</button><button onclick="showDevSkillToast('设备故障代码解析')" role="menuitem" >⚙️ 设备故障代码解析</button></div></div>
@@ -178,7 +180,7 @@
 <script>
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', function() {
-        navigator.serviceWorker.register('/static/sw.js').then(function(reg) {
+        navigator.serviceWorker.register('/static/sw.js?v=20261026-mobile1').then(function(reg) {
             console.log('SW registered:', reg.scope);
             reg.addEventListener('updatefound', function() {
                 var newWorker = reg.installing;
@@ -214,5 +216,6 @@ function toggleFaq(el) {
 }
 </script>
 <script src="/static/js/app.js?v=20261008-account-provider"></script>
+    <script src="/static/js/responsive.js?v=20261026-mobile1"></script>
 </body>
 </html>

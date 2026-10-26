@@ -4,12 +4,14 @@
  * 版本: 1.0.0
  */
 
-const CACHE_NAME = 'dfagent3-20261008-account-provider';
-const STATIC_CACHE = 'docagent-static-v1.0.0';
+const CACHE_NAME = 'dfagent3-cache_name-20261026-mobile1';
+const STATIC_CACHE = 'dfagent3-static_cache-20261026-mobile1';
 const DYNAMIC_CACHE = 'docagent-dynamic-v1.0.0';
 
 // 需要预缓存的静态资源
 const PRECACHE_URLS = [
+    '/static/css/responsive.css?v=20261026-mobile1',
+    '/static/js/responsive.js?v=20261026-mobile1',
     '/',
     '/static/css/style.css',
     '/static/js/app.js',
